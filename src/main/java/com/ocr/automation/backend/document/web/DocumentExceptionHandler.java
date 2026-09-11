@@ -4,6 +4,7 @@ import com.ocr.automation.backend.document.service.DocumentNotFoundException;
 import com.ocr.automation.backend.document.service.InvalidDocumentException;
 import com.ocr.automation.backend.document.web.dto.ErrorResponse;
 import com.ocr.automation.backend.ocr.OcrEngineException;
+import com.ocr.automation.backend.owner.OwnerNotResolvedException;
 import com.ocr.automation.backend.storage.DocumentStorageException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
@@ -32,6 +33,12 @@ public class DocumentExceptionHandler {
     public ResponseEntity<ErrorResponse> handleInvalid(InvalidDocumentException e) {
         return ResponseEntity.badRequest()
                 .body(ErrorResponse.of("INVALID_DOCUMENT", e.getMessage()));
+    }
+
+    @ExceptionHandler(OwnerNotResolvedException.class)
+    public ResponseEntity<ErrorResponse> handleOwnerNotResolved(OwnerNotResolvedException e) {
+        return ResponseEntity.badRequest()
+                .body(ErrorResponse.of("OWNER_REQUIRED", e.getMessage()));
     }
 
     @ExceptionHandler(MaxUploadSizeExceededException.class)

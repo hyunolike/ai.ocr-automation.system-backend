@@ -28,8 +28,12 @@ import java.util.UUID;
  */
 @Entity
 @Table(name = "documents", indexes = {
+        // 스케줄러가 시스템 전체의 대기 문서를 집을 때 쓴다. 소유자를 가리지 않는 유일한 조회다.
         @Index(name = "idx_documents_status_uploaded_at", columnList = "status, uploaded_at"),
-        @Index(name = "idx_documents_checksum", columnList = "checksum")
+        // 공개 API 의 목록 조회. 소유자 조건이 항상 붙으므로 선두 컬럼이어야 한다.
+        @Index(name = "idx_documents_owner_status_uploaded", columnList = "owner_id, status, uploaded_at"),
+        // 중복 업로드 판정. 전역이 아니라 소유자 범위로 본다.
+        @Index(name = "idx_documents_owner_checksum", columnList = "owner_id, checksum")
 })
 @Getter
 @NoArgsConstructor(access = AccessLevel.PROTECTED)
@@ -42,6 +46,15 @@ public class Document {
     /** 외부에 노출하는 식별자. DB 채번 값을 그대로 드러내지 않는다 */
     @Column(name = "public_id", nullable = false, unique = true, length = 36)
     private String publicId;
+
+    /**
+     * 문서 소유자.
+     *
+     * <p>공개 API 의 모든 조회에 이 값이 조건으로 붙는다. 소유자가 없으면
+     * 인증을 붙여도 인가할 대상이 없다.
+     */
+    @Column(name = "owner_id", nullable = false, length = 64)
+    private String ownerId;
 
     @Column(name = "original_filename", nullable = false, length = 255)
     private String originalFilename;
@@ -87,10 +100,14 @@ public class Document {
     @Column(name = "version", nullable = false)
     private long version;
 
-    public static Document register(String originalFilename, String contentType,
+    public static Document register(String ownerId, String originalFilename, String contentType,
                                     long sizeBytes, String checksum, String storageKey) {
+        if (ownerId == null || ownerId.isBlank()) {
+            throw new IllegalArgumentException("소유자는 필수입니다");
+        }
         Document document = new Document();
         document.publicId = UUID.randomUUID().toString();
+        document.ownerId = ownerId;
         document.originalFilename = originalFilename;
         document.contentType = contentType;
         document.sizeBytes = sizeBytes;

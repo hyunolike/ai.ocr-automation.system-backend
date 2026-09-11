@@ -16,7 +16,7 @@ class DocumentTest {
     private static final int MAX_RETRIES = 3;
 
     private Document newDocument() {
-        return Document.register("scan.png", "image/png", 1024L, "checksum", "2026/09/11/key.png");
+        return Document.register("owner-1", "scan.png", "image/png", 1024L, "checksum", "2026/09/11/key.png");
     }
 
     private OcrResult sampleResult() {
@@ -30,7 +30,16 @@ class DocumentTest {
         assertThat(document.getStatus()).isEqualTo(DocumentStatus.PENDING);
         assertThat(document.getRetryCount()).isZero();
         assertThat(document.getPublicId()).isNotBlank();
+        assertThat(document.getOwnerId()).isEqualTo("owner-1");
         assertThat(document.hasOcrResult()).isFalse();
+    }
+
+    @Test
+    void 소유자_없이는_등록할_수_없다() {
+        assertThatThrownBy(() -> Document.register(
+                "  ", "scan.png", "image/png", 1024L, "checksum", "key.png"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("소유자는 필수입니다");
     }
 
     @Test

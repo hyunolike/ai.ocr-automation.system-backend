@@ -53,7 +53,7 @@ class DocumentProcessingServiceTest {
 
     private Document documentWithId(long id) {
         Document document = Document.register(
-                "scan-%d.png".formatted(id), "image/png", 100L, "checksum-" + id, "key-" + id);
+                "owner-1", "scan-%d.png".formatted(id), "image/png", 100L, "checksum-" + id, "key-" + id);
         // id 는 JPA 가 채우는 값이라 테스트에서는 리플렉션으로 넣는다
         try {
             var field = Document.class.getDeclaredField("id");

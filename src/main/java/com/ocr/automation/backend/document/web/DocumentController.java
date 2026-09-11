@@ -5,6 +5,7 @@ import com.ocr.automation.backend.document.domain.DocumentStatus;
 import com.ocr.automation.backend.document.service.DocumentApplicationService;
 import com.ocr.automation.backend.document.service.InvalidDocumentException;
 import com.ocr.automation.backend.document.web.dto.DocumentResponse;
+import com.ocr.automation.backend.owner.DocumentOwnerResolver;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
@@ -28,6 +29,9 @@ import java.net.URI;
  * 문서 업로드/조회 공개 API.
  *
  * <p>어댑터 계층이다. 비즈니스 로직은 두지 않고 DTO 변환과 위임만 한다.
+ *
+ * <p>소유자는 <b>요청 파라미터로 받지 않는다.</b> {@link DocumentOwnerResolver} 에 묻는다.
+ * 클라이언트가 보낸 값을 그대로 쓰면 파라미터 하나로 남의 문서를 조회할 수 있다.
  */
 @Slf4j
 @RestController
@@ -38,11 +42,13 @@ public class DocumentController {
     private static final int MAX_PAGE_SIZE = 100;
 
     private final DocumentApplicationService documentApplicationService;
+    private final DocumentOwnerResolver ownerResolver;
 
     /** 문서를 업로드하고 OCR 대기열에 올린다. */
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<DocumentResponse> upload(@RequestParam("file") MultipartFile file) {
         Document document = documentApplicationService.upload(
+                ownerResolver.currentOwnerId(),
                 file.getOriginalFilename(), file.getContentType(), readBytes(file));
         return ResponseEntity
                 .created(URI.create("/api/v1/documents/" + document.getPublicId()))
@@ -51,7 +57,8 @@ public class DocumentController {
 
     @GetMapping("/{publicId}")
     public DocumentResponse get(@PathVariable String publicId) {
-        return DocumentResponse.from(documentApplicationService.findByPublicId(publicId));
+        return DocumentResponse.from(
+                documentApplicationService.findByPublicId(ownerResolver.currentOwnerId(), publicId));
     }
 
     @GetMapping
@@ -63,7 +70,9 @@ public class DocumentController {
                 Math.max(page, 0),
                 Math.clamp(size, 1, MAX_PAGE_SIZE),
                 Sort.by(Sort.Direction.DESC, "uploadedAt"));
-        return documentApplicationService.findAll(status, pageable).map(DocumentResponse::from);
+        return documentApplicationService
+                .findAll(ownerResolver.currentOwnerId(), status, pageable)
+                .map(DocumentResponse::from);
     }
 
     /** 추출된 전체 텍스트. 길이가 커질 수 있어 별도 엔드포인트로 분리했다. */
@@ -71,7 +80,8 @@ public class DocumentController {
     public ResponseEntity<String> text(@PathVariable String publicId) {
         return ResponseEntity.ok()
                 .header(HttpHeaders.CONTENT_TYPE, "text/plain;charset=UTF-8")
-                .body(documentApplicationService.extractedTextOf(publicId));
+                .body(documentApplicationService.extractedTextOf(
+                        ownerResolver.currentOwnerId(), publicId));
     }
 
     private byte[] readBytes(MultipartFile file) {

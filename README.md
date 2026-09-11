@@ -14,6 +14,7 @@ OCR 자동화 시스템의 **백엔드**. 문서 업로드/조회 API 와 OCR �
 - **느린 작업이 DB 커넥션도 HTTP 요청 스레드도 잡지 않게 한다** — 상태 전이(짧은 트랜잭션)와
   OCR 실행(워커 풀, 트랜잭션 밖)을 분리한다
 - **상태 전이 규칙은 도메인이 지킨다** — setter 없이 의미 있는 메서드로만 상태를 바꾼다
+- **남의 문서가 새어나가지 않게 한다** — 공개 API 의 모든 조회에 소유자 조건이 붙는다
 
 <br>
 
@@ -69,6 +70,16 @@ PENDING ──startProcessing──▶ PROCESSING ──completeWith──▶ CO
 
 ### 공개 API
 
+모든 공개 API 는 **소유자 헤더**를 요구한다.
+
+```
+X-Owner-Id: <소유자 식별자>
+```
+
+> ⚠️ **이 헤더는 인증이 아니다.** 누구나 마음대로 보낼 수 있다. 지금은 소유자 *격리*를
+> 먼저 세우기 위한 자리표시자이며, Phase 1.3 에서 API Key 해석으로 교체한다.
+> 그전까지 이 서비스를 신뢰할 수 없는 네트워크에 노출해서는 안 된다.
+
 | Method | Path | 설명 |
 |---|---|---|
 | `POST` | `/api/v1/documents` | 문서 업로드 (multipart, 필드명 `file`) → `201` |
@@ -97,7 +108,8 @@ PENDING ──startProcessing──▶ PROCESSING ──completeWith──▶ CO
 
 | code | HTTP | 상황 |
 |---|---|---|
-| `DOCUMENT_NOT_FOUND` | 404 | 없는 문서 |
+| `OWNER_REQUIRED` | 400 | `X-Owner-Id` 헤더 누락·공백·과길이 |
+| `DOCUMENT_NOT_FOUND` | 404 | 없는 문서, **또는 남의 문서** |
 | `INVALID_DOCUMENT` | 400 | 형식·크기 위반, 결과가 아직 없음, 처리 대기 상태가 아님 |
 | `FILE_TOO_LARGE` | 413 | 업로드 크기 초과 |
 | `STORAGE_ERROR` | 500 | 스토리지 입출력 실패 |
@@ -125,6 +137,9 @@ com.ocr.automation.backend
 ├── storage/
 │   ├── DocumentStorage.java              # 포트
 │   └── local/LocalFileSystemDocumentStorage
+├── owner/
+│   ├── DocumentOwnerResolver.java        # 포트 — 1.3 인증이 갈아끼울 자리
+│   └── header/HeaderDocumentOwnerResolver # 임시 구현 (인증 아님)
 └── config/
 ```
 
@@ -193,6 +208,46 @@ public interface OcrEngine {
 
 <br>
 
+## 👤 소유자 격리
+
+공개 API 의 **모든** 조회에 소유자 조건이 붙는다. 리포지토리도 두 갈래로 갈라 두었다.
+
+| 갈래 | 쓰는 곳 | 예 |
+|---|---|---|
+| 소유자 범위 | 공개 API | `findByPublicIdAndOwnerId`, `findByOwnerIdAndStatus` |
+| 시스템 범위 | 내부 처리(스케줄러) | `findByStatusOrderByUploadedAtAsc` |
+
+스케줄러는 시스템 전체의 대기 문서를 집어야 하므로 소유자를 가리지 않는다.
+그래서 `(status, uploaded_at)` 인덱스를 그대로 두고, 공개 조회용으로
+`(owner_id, status, uploaded_at)` 을 따로 만들었다.
+
+### 두 가지 설계상 선택
+
+**중복 판정은 소유자 범위다.** 전역 체크섬으로 보면 다른 사용자가 올린 파일과 같은
+파일을 올렸을 때 **남의 문서 ID 를 돌려받는다.** 정보 노출이다.
+
+**남의 문서에는 403 이 아니라 404 를 준다.** 403 은 "그 문서가 존재한다"는 사실을
+알려주는 셈이라 그 자체로 정보가 샌다. 없는 문서를 조회했을 때와 응답이 구분되지 않는다.
+
+### 소유자는 어디서 오는가
+
+컨트롤러는 소유자를 **파라미터로 받지 않는다.** `DocumentOwnerResolver` 에 묻는다.
+클라이언트가 보낸 값을 그대로 쓰면 파라미터 하나로 남의 문서를 조회할 수 있기 때문이다.
+
+```java
+public interface DocumentOwnerResolver {
+    String currentOwnerId();
+}
+```
+
+현재 구현은 `X-Owner-Id` 헤더를 읽는 자리표시자다. Phase 1.3 에서 API Key 를
+해석하는 구현으로 바꿔 끼우면 **서비스와 도메인은 손대지 않는다.**
+
+기본 소유자를 두지 않은 이유: 헤더가 없을 때 조용히 기본값으로 떨어지면 인증을 붙이지
+않은 채로도 시스템이 그럭저럭 돌아가 보이고, 그 상태가 운영까지 따라가기 쉽다.
+
+<br>
+
 ## 🏃 실행
 
 **설정 서버가 먼저 떠 있어야 한다.** 이 서비스는 포트·DB·스토리지 설정을
@@ -214,13 +269,13 @@ cd ../ai.ocr-automation.system-config.server && ./gradlew bootRun
 
 ```bash
 # 업로드
-curl -F "file=@scan.png" http://localhost:8080/api/v1/documents
+curl -H "X-Owner-Id: demo" -F "file=@scan.png" http://localhost:8080/api/v1/documents
 
-# 처리 (평소엔 스케줄러가 호출한다)
+# 처리 (평소엔 스케줄러가 호출한다. 내부 API 는 소유자를 가리지 않는다)
 curl -X POST http://localhost:8080/internal/v1/ocr/process-pending
 
 # 결과
-curl http://localhost:8080/api/v1/documents/{id}/text
+curl -H "X-Owner-Id: demo" http://localhost:8080/api/v1/documents/{id}/text
 ```
 
 ### 테스트
@@ -234,6 +289,7 @@ curl http://localhost:8080/api/v1/documents/{id}/text
 | `DocumentTest` | 상태 전이 규칙 (재시도, 정체 판정, 잘못된 전이 차단) |
 | `LocalFileSystemDocumentStorageTest` | 키 생성, 경로 조작 차단, 파일명 충돌 |
 | `DocumentProcessingServiceTest` | 접수 규칙 — 큐 포화 시 선점 해제, 재시도 횟수 미증가 |
+| `DocumentOwnerIsolationTest` | 소유자 격리 — 남의 문서 차단, 소유자별 중복 판정, 헤더 누락 |
 | `DocumentPipelineIntegrationTest` | 업로드 → 접수 → 비동기 처리 → 조회 HTTP 왕복 |
 
 > 테스트는 **Flyway 로 스키마를 만들고 JPA 는 `validate` 만** 한다.
@@ -248,8 +304,9 @@ curl http://localhost:8080/api/v1/documents/{id}/text
 
 | 인덱스 | 용도 |
 |---|---|
-| `(status, uploaded_at)` | 스케줄러가 "오래 기다린 PENDING" 을 집을 때 |
-| `(checksum)` | 중복 업로드 판정 |
+| `(status, uploaded_at)` | 스케줄러가 시스템 전체의 "오래 기다린 PENDING" 을 집을 때 |
+| `(owner_id, status, uploaded_at)` | 공개 API 목록 조회 (소유자 조건이 항상 붙는다) |
+| `(owner_id, checksum)` | 중복 업로드 판정 (소유자 범위) |
 
 `@Version` 낙관적 락을 둔 이유: 스케줄러가 여러 인스턴스로 뜨면 같은 문서를 동시에
 집을 수 있다. 진 쪽은 조용히 건너뛴다.
@@ -274,7 +331,8 @@ curl http://localhost:8080/api/v1/documents/{id}/text
 
 초기 구조 단계라 의도적으로 비워둔 부분. 실사용 전에 각각 해결해야 한다.
 
-- **인증·인가가 없다** — 공개 API 도 `/internal` 도 누구나 호출할 수 있다. 특히 `/internal` 이 열려 있으면 외부에서 배치를 마음대로 돌릴 수 있다.
+- **인증이 없다** — 소유자 *격리*는 들어왔지만 소유자를 *증명*하는 장치가 없다. `X-Owner-Id` 헤더는 누구나 바꿔 보낼 수 있으므로, 남의 소유자 식별자를 알면 그 문서를 볼 수 있다. Phase 1.3 에서 API Key 로 교체한다.
+- **`/internal` 이 공개 포트에 열려 있다** — 누구나 배치를 돌리거나 정체 회수를 부를 수 있다. 내부 포트 분리와 서비스 간 인증이 필요하다.
 - **파일 내용을 검증하지 않는다** — `Content-Type` 헤더만 믿는다. 확장자를 바꾼 실행 파일도 통과하므로 매직 바이트 검사가 필요하다.
 - **파일 전체를 메모리에 올린다** — `MultipartFile.getBytes()` 로 통째로 읽는다. 20MB 제한이 있어 당장은 버티지만, 큰 파일을 다루려면 스트리밍으로 바꿔야 한다.
 - **Tesseract 신뢰도를 수집하지 않는다** — `confidence` 가 항상 `null` 이다. tess4j 의 `getWords()` 로 단어 단위 신뢰도를 모아야 한다.
@@ -287,7 +345,8 @@ curl http://localhost:8080/api/v1/documents/{id}/text
 
 ## 🗺 앞으로
 
-- [ ] `/internal` 서비스 간 인증 (내부망 제한 또는 토큰)
+- [ ] API Key 인증으로 `DocumentOwnerResolver` 교체 (헤더 구현 제거)
+- [ ] `/internal` 서비스 간 인증 (내부 포트 분리 + 토큰)
 - [ ] 매직 바이트 기반 파일 형식 검증
 - [ ] Tesseract 단어 단위 신뢰도 수집
 - [ ] S3 스토리지 어댑터 추가 (포트는 그대로)
