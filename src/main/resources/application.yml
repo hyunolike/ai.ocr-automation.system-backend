@@ -1,0 +1,21 @@
+# 이 파일에는 "설정 서버를 어떻게 찾을지"만 둔다.
+# 포트, DB, 스토리지, OCR 엔진 설정은 모두 ocr-config-server 가 내려준다.
+spring:
+  application:
+    # 설정 서버가 ocr-backend.yml 을 찾는 기준이 되는 이름. 바꾸면 설정을 못 받는다.
+    name: ocr-backend
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:local}
+  config:
+    import: "configserver:${CONFIG_SERVER_URL:http://localhost:8888}"
+  cloud:
+    config:
+      # 설정 서버 자격증명. 부트스트랩 값이라 설정 서버로 내려받을 수 없다(닭과 달걀).
+      username: ${CONFIG_USER:ocr}
+      password: ${CONFIG_PASSWORD:local-dev-only-password}
+      # 설정을 못 받으면 잘못된 기본값으로 뜨는 대신 기동에 실패한다
+      fail-fast: true
+      retry:
+        max-attempts: 6
+        initial-interval: 1000
+        max-interval: 5000
