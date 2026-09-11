@@ -1,235 +1,243 @@
-# OCR 자동화 백엔드
+# OCR Automation Backend
 
-> 문서를 받아 OCR로 텍스트를 추출하고 보관하는 서비스.
-> **Spring Boot + Tesseract** 위에서 포트/어댑터 구조로 구성했다.
+**English** | [한국어](README.ko.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
-OCR은 느리고, 자주 실패하고, 엔진이 바뀐다. 이 세 가지를 전제로 두고
-**느린 작업이 요청을 붙잡지 않게**, **실패해도 문서가 유실되지 않게**,
-**엔진을 갈아끼워도 비즈니스 로직이 그대로이게** 만드는 것이 목표다.
+> A service that takes documents, extracts text with OCR and keeps the results.
+> Built on **Spring Boot + Tesseract** with a ports-and-adapters structure.
 
-"언제 처리할지"는 [scheduler](https://github.com/hyunolike/ai.ocr-automation.system-backend.scheduler)가 정하고,
-이 서비스는 **"어떻게 처리할지"만** 안다.
+OCR is slow, it fails often, and the engine gets replaced. Taking those three as
+given, the goal is to make sure **slow work never pins a request**, **a failure never
+loses a document**, and **swapping the engine leaves the business logic untouched**.
 
-<br>
-
-## 🎯 설계 목표
-
-- **OCR 엔진을 갈아끼울 수 있게 한다** — 비즈니스 로직은 `OcrEngine` 포트만 알고, Tesseract는 어댑터 하나일 뿐이다
-- **스토리지를 갈아끼울 수 있게 한다** — 로컬 FS → S3 전환이 도메인에 닿지 않게 `DocumentStorage` 포트로 끊는다
-- **느린 작업이 DB 커넥션도 HTTP 스레드도 잡지 않게 한다** — 접수와 처리를 분리한다
-- **상태 전이 규칙은 도메인이 지킨다** — setter 없이 의미 있는 메서드로만 상태를 바꾼다
-- **남의 문서가 새어나가지 않게 한다** — 공개 API의 모든 조회에 소유자 조건이 붙는다
+"When to process" is the [scheduler](https://github.com/hyunolike/ai.ocr-automation.system-backend.scheduler)'s
+call; this service knows **only "how"**.
 
 <br>
 
-## 🚀 기능 요구사항
+## 🎯 Design Goals
 
-### 문서 업로드
-
-- 이미지(PNG/JPEG/TIFF) 또는 PDF를 받아 보관하고 OCR 대기열에 올린다.
-- 파일 형식은 **헤더가 아니라 내용(매직 바이트)으로 판단한다.**
-  확장자와 `Content-Type`은 얼마든지 바꿀 수 있다.
-- 같은 소유자가 같은 내용(체크섬 일치)을 다시 올리면 새로 저장하지 않고 기존 문서를 돌려준다.
-  - 단, 기존 문서가 `FAILED`라면 재시도 횟수를 초기화하고 다시 대기열에 올린다.
-- 원본 파일명은 스토리지 키에 넣지 않는다. 경로 조작과 파일명 충돌을 애초에 만들지 않는다.
-
-### OCR 처리
-
-- 대기 중인 문서를 배치로 **접수**하고 워커 풀에서 처리한다.
-- 접수는 처리를 기다리지 않고 즉시 응답한다. (`202 Accepted`)
-- 워커 큐가 가득 차면 더 선점하지 않고 거부 수를 돌려준다. 남은 문서는 다음 주기에 다시 집힌다.
-- 처리에 실패하면 재시도 여유에 따라 `PENDING`으로 되돌리거나 `FAILED`로 확정한다.
-- 처리 도중 인스턴스가 죽어 `PROCESSING`에 멈춘 문서는 일정 시간 뒤 회수한다.
-
-### 조회
-
-- 문서 상태와 추출 결과 요약을 조회한다.
-- 추출된 전체 텍스트는 **별도 엔드포인트**로 받는다. 길어질 수 있어 상세 응답에 싣지 않는다.
-- 목록은 상태로 거를 수 있고, 최신순으로 정렬한다.
-
-### 인증과 소유자
-
-- 공개 API는 **API 키**를 요구한다. 키가 소유자를 결정한다.
-- 요청 어디에도 소유자를 지정하는 자리를 두지 않는다.
-- 내부 API(`/internal`)는 **공유 토큰**을 요구한다. 스케줄러 전용이다.
-- 규칙에 없는 경로는 모두 거절한다.
-
-### 예외 처리
-
-- 아래 업로드 요청은 거부한다.
-  - 빈 파일이거나 허용 크기를 넘는 경우
-  - 허용 목록에 없는 형식인 경우
-  - **파일 내용이 선언한 형식과 다른 경우**
-  - 암호화됐거나 페이지 수 상한을 넘는 PDF인 경우
-- 남의 문서를 지목한 경우 **403이 아니라 404**로 응답한다.
-- 예상하지 못한 예외는 `INTERNAL_ERROR`로 묶고, 원인은 서버 로그에만 남긴다.
+- **Make the OCR engine swappable** — business logic knows only the `OcrEngine` port; Tesseract is just one adapter
+- **Make storage swappable** — the `DocumentStorage` port keeps a local FS → S3 move away from the domain
+- **Keep slow work off both the DB connection and the HTTP thread** — separate acceptance from processing
+- **Let the domain enforce state transitions** — no setters, only meaningful methods
+- **Never leak someone else's documents** — every public query carries an owner condition
 
 <br>
 
-## 📄 인터페이스 규격
+## 🚀 Functional Requirements
 
-### 공개 API
+### Uploading a document
 
-모든 공개 API는 API 키를 요구한다.
+- Accept an image (PNG/JPEG/TIFF) or a PDF, store it and queue it for OCR.
+- Decide the file type from **its content (magic bytes), not the header.**
+  Extensions and `Content-Type` can be anything the caller likes.
+- If the same owner re-uploads identical content (matching checksum), return the
+  existing document instead of storing it again.
+  - Unless that document is `FAILED` — then reset the retry count and queue it again.
+- Never put the original filename into the storage key. Path traversal and filename
+  collisions simply never arise.
+
+### OCR processing
+
+- **Accept** pending documents in batches and process them in a worker pool.
+- Acceptance returns immediately without waiting for processing. (`202 Accepted`)
+- When the worker queue is full, stop claiming and report the rejected count.
+  The remaining documents get picked up on the next tick.
+- On failure, return the document to `PENDING` if retries remain, otherwise mark it `FAILED`.
+- Documents stuck in `PROCESSING` because an instance died are recovered after a while.
+
+### Querying
+
+- Fetch a document's status and a summary of its extraction result.
+- The full extracted text comes from a **separate endpoint** — it can get long,
+  so it isn't carried in the detail response.
+- Lists can be filtered by status and are sorted newest first.
+
+### Authentication and ownership
+
+- Public APIs require an **API key**. The key determines the owner.
+- Nowhere in a request is there a place to name an owner.
+- Internal APIs (`/internal`) require a **shared token**. They are the scheduler's.
+- Any path not covered by a rule is denied.
+
+### Error handling
+
+- Reject these uploads:
+  - Empty files, or files over the size limit
+  - Types outside the allow-list
+  - **Content that doesn't match the declared type**
+  - PDFs that are encrypted or exceed the page limit
+- Answer **404, not 403**, when someone names a document that isn't theirs.
+- Collapse unexpected exceptions into `INTERNAL_ERROR`, leaving the cause in the server log only.
+
+<br>
+
+## 📄 Interface Specification
+
+### Public API
+
+Every public API requires an API key.
 
 ```
 X-API-Key: ocrk_...
-Authorization: Bearer ocrk_...   # 둘 다 받는다
+Authorization: Bearer ocrk_...   # both accepted
 ```
 
-| Method | Path | 설명 |
+| Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/v1/documents` | 문서 업로드 (multipart, 필드명 `file`) → `201` |
-| `GET` | `/api/v1/documents/{id}` | 문서 상태·결과 요약 |
-| `GET` | `/api/v1/documents?status=&page=&size=` | 목록 (상태 필터, 최신순) |
-| `GET` | `/api/v1/documents/{id}/text` | 추출된 전체 텍스트 (`text/plain`) |
+| `POST` | `/api/v1/documents` | Upload (multipart, field `file`) → `201` |
+| `GET` | `/api/v1/documents/{id}` | Status and result summary |
+| `GET` | `/api/v1/documents?status=&page=&size=` | List (status filter, newest first) |
+| `GET` | `/api/v1/documents/{id}/text` | Full extracted text (`text/plain`) |
 
-### 내부 API
+### Internal API
 
-스케줄러 전용. 공유 토큰을 요구한다.
+Scheduler only. Requires the shared token.
 
 ```
-X-Internal-Token: <토큰>
+X-Internal-Token: <token>
 ```
 
-| Method | Path | 설명 |
+| Method | Path | Description |
 |---|---|---|
-| `POST` | `/internal/v1/ocr/process-pending?batchSize=20` | 대기 문서를 워커 풀에 **접수** → `202` |
-| `POST` | `/internal/v1/ocr/documents/{id}/process` | 한 건 **동기** 처리 (수동 재처리) |
-| `POST` | `/internal/v1/ocr/recover-stalled` | 정체된 `PROCESSING` 문서 회수 |
-| `POST` | `/internal/v1/api-keys` | API 키 발급 (평문은 이 응답에서만) |
-| `GET` | `/internal/v1/api-keys?ownerId=` | 키 목록 (평문·해시 미포함) |
-| `DELETE` | `/internal/v1/api-keys/{prefix}` | 키 폐기 |
+| `POST` | `/internal/v1/ocr/process-pending?batchSize=20` | **Accept** pending documents into the worker pool → `202` |
+| `POST` | `/internal/v1/ocr/documents/{id}/process` | Process one **synchronously** (manual retry) |
+| `POST` | `/internal/v1/ocr/recover-stalled` | Recover documents stuck in `PROCESSING` |
+| `POST` | `/internal/v1/api-keys` | Issue an API key (plaintext appears only in this response) |
+| `GET` | `/internal/v1/api-keys?ownerId=` | List keys (no plaintext, no hash) |
+| `DELETE` | `/internal/v1/api-keys/{prefix}` | Revoke a key |
 
-> ⚠️ 토큰은 **2차 방어**다. 1차는 네트워크다 — `/internal`은 방화벽이나 인그레스에서
-> 외부에 닿지 않게 막아야 한다.
+> ⚠️ The token is a **second line of defence.** The first is the network —
+> `/internal` should be unreachable from outside via firewall or ingress rules.
 
-### 문서 상태
+### Document status
 
 ```
 PENDING ──startProcessing──▶ PROCESSING ──completeWith──▶ COMPLETED
    ▲                              │
-   │                              └──fail──▶ FAILED (재시도 한도 소진)
+   │                              └──fail──▶ FAILED (retries exhausted)
    └──────────────────────────────┘
-        재시도 여유가 남아 있으면 PENDING으로 되돌아간다
+        goes back to PENDING while retries remain
 ```
 
-| 상태 | 의미 |
+| Status | Meaning |
 |---|---|
-| `PENDING` | 업로드 완료, OCR 대기 |
-| `PROCESSING` | OCR 처리 중 |
-| `COMPLETED` | OCR 성공 |
-| `FAILED` | 재시도 한도 소진 |
+| `PENDING` | Uploaded, waiting for OCR |
+| `PROCESSING` | OCR in progress |
+| `COMPLETED` | OCR succeeded |
+| `FAILED` | Retries exhausted |
 
-### 오류 코드
+### Error codes
 
 ```json
 { "code": "CONTENT_MISMATCH", "message": "...", "timestamp": "2026-09-11T10:23:29Z" }
 ```
 
-| code | HTTP | 상황 |
+| code | HTTP | Situation |
 |---|---|---|
-| `UNAUTHORIZED` | 401 | API 키 누락·오류·폐기됨 (내부 API는 토큰 누락·오류) |
-| `FORBIDDEN` | 403 | 인증은 됐으나 그 경로의 권한이 아님 |
-| `CONTENT_MISMATCH` | 400 | 내용이 선언한 형식과 다름, 손상·암호화된 PDF, 페이지 수 초과 |
-| `INVALID_DOCUMENT` | 400 | 빈 파일, 허용 목록 밖 형식, 결과가 아직 없음, 처리 대기 상태가 아님 |
-| `DOCUMENT_NOT_FOUND` | 404 | 없는 문서, **또는 남의 문서** |
-| `FILE_TOO_LARGE` | 413 | 업로드 크기 초과 |
-| `STORAGE_ERROR` | 500 | 스토리지 입출력 실패 |
-| `OCR_ENGINE_ERROR` | 503 | 엔진 사용 불가 |
-| `INTERNAL_ERROR` | 500 | 그 밖의 예외 (원인은 서버 로그에만) |
+| `UNAUTHORIZED` | 401 | API key missing, wrong or revoked (internal: token missing or wrong) |
+| `FORBIDDEN` | 403 | Authenticated, but not for that path |
+| `CONTENT_MISMATCH` | 400 | Content doesn't match the declared type; corrupt or encrypted PDF; too many pages |
+| `INVALID_DOCUMENT` | 400 | Empty file, type outside the allow-list, no result yet, not awaiting processing |
+| `DOCUMENT_NOT_FOUND` | 404 | No such document — **or it belongs to someone else** |
+| `FILE_TOO_LARGE` | 413 | Over the upload size limit |
+| `STORAGE_ERROR` | 500 | Storage I/O failure |
+| `OCR_ENGINE_ERROR` | 503 | Engine unavailable |
+| `INTERNAL_ERROR` | 500 | Anything else (cause stays in the server log) |
 
 <br>
 
-## 📐 프로그래밍 요구사항
+## 📐 Programming Requirements
 
-- Java 21, Spring Boot 3.5.16, Spring Cloud Config Client를 사용한다.
-- DB는 PostgreSQL(운영) / H2(로컬·테스트), 스키마는 **Flyway 단일 출처**로 관리한다.
-  JPA는 `validate`만 하고 스키마를 만들지 않는다.
-- **`OcrEngine`과 `DocumentStorage`는 포트다.** 비즈니스 로직은 이 인터페이스만 알고,
-  구체 구현(Tesseract, 로컬 FS)은 어댑터로 갈아끼운다.
-- **`DocumentApplicationService`는 HTTP도 OCR 엔진도 몰라야 한다.**
-  REST를 다른 프로토콜로 바꿔도 그대로 재사용 가능해야 한다.
-- **`DocumentProcessingService`에는 `@Transactional`을 두지 않는다.**
-  느린 OCR이 DB 커넥션을 잡지 않도록 상태 전이는 별도 빈에 맡긴다.
-  (같은 클래스 안에서 호출하면 프록시를 타지 않아 트랜잭션이 분리되지 않는다.)
-- 도메인 객체는 setter를 열지 않고, 정적 팩토리와 의미 있는 메서드로 상태를 바꾼다.
-  잘못된 상태 전이는 서비스가 아니라 도메인이 막는다.
-- **컨트롤러는 소유자를 파라미터로 받지 않는다.** `DocumentOwnerResolver`에 묻는다.
-- **커밋 단위는 아래 기능 목록 단위로 한다.**
+- Use Java 21, Spring Boot 3.5.16 and Spring Cloud Config Client.
+- PostgreSQL (production) / H2 (local and test); the schema has a **single source,
+  Flyway.** JPA only `validate`s — it never creates the schema.
+- **`OcrEngine` and `DocumentStorage` are ports.** Business logic knows only these
+  interfaces; concrete implementations (Tesseract, local FS) are swappable adapters.
+- **`DocumentApplicationService` must know nothing of HTTP or the OCR engine.**
+  Swapping REST for another protocol should leave it reusable as is.
+- **Do not put `@Transactional` on `DocumentProcessingService`.**
+  State transitions belong to a separate bean so slow OCR never holds a DB connection.
+  (Calling from within the same class skips the proxy, so the transaction wouldn't separate.)
+- Domain objects expose no setters; state changes go through static factories and
+  meaningful methods. Invalid transitions are blocked by the domain, not the service.
+- **Controllers never take the owner as a parameter.** They ask `DocumentOwnerResolver`.
+- **Commit granularity follows the feature checklist below.**
 
 <br>
 
-## ✅ 구현할 기능 목록
+## ✅ Feature Checklist
 
-- [x] 도메인 `Document` / `DocumentStatus` / `OcrResult`
-  - [x] `Document.register()` 정적 팩토리 — 소유자 없이는 등록 불가
-  - [x] `startProcessing()` / `completeWith()` / `fail()` 상태 전이
-  - [x] `releaseClaim()` — 큐 거부 시 재시도 횟수를 올리지 않고 반납
-  - [x] `resetForRetry()` — 실패 문서 재업로드 시 재시도 횟수 초기화
-  - [x] `isStalled()` / `recoverFromStall()` — 정체 판정과 회수
-  - [x] `@Version` 낙관적 락 — 다중 인스턴스 중복 선점 방지
+- [x] Domain `Document` / `DocumentStatus` / `OcrResult`
+  - [x] `Document.register()` static factory — no owner, no registration
+  - [x] `startProcessing()` / `completeWith()` / `fail()` transitions
+  - [x] `releaseClaim()` — hand back without incrementing retries when the queue refuses
+  - [x] `resetForRetry()` — reset retries when a failed document is re-uploaded
+  - [x] `isStalled()` / `recoverFromStall()` — stall detection and recovery
+  - [x] `@Version` optimistic lock — no double claiming across instances
 - [x] `DocumentRepository`
-  - [x] 소유자 범위 / 시스템 범위 조회를 이름과 주석으로 분리
-- [x] `DocumentApplicationService` — 등록·조회
-  - [x] 크기·형식·내용 검증
-  - [x] SHA-256 체크섬 기반 중복 판정 (소유자 범위)
-  - [x] 실패 문서 재업로드 시 재처리
-- [x] OCR 처리 파이프라인
-  - [x] `DocumentProcessingService` — 선점 → 워커 풀 위임 (트랜잭션 없음)
-  - [x] `DocumentTransitionService` — 상태 전이 전용 (`REQUIRES_NEW`)
-  - [x] 바운드 큐 + `AbortPolicy` 백프레셔
-  - [x] 어떤 예외가 나도 문서를 `PROCESSING`에 남기지 않는다
-- [x] `OcrEngine` 포트
-  - [x] `TesseractOcrEngine` 어댑터
-  - [x] `StubOcrEngine` — 네이티브 없는 환경용
-  - [ ] Tesseract 단어 단위 신뢰도 수집
-  - [ ] 이미지 전처리 (이진화·기울기 보정)
-  - [ ] PDF 페이지 단위 처리
-- [x] `DocumentStorage` 포트
-  - [x] `LocalFileSystemDocumentStorage` — 날짜 기반 키, 경로 이탈 차단
-  - [ ] S3 어댑터
-- [x] 업로드 형식 검증
-  - [x] 매직 바이트 (PNG / JPEG / TIFF / PDF)
-  - [x] PDF 암호화 여부·페이지 수 상한
-- [x] 인증·인가
-  - [x] API 키 — SHA-256 해시 저장, 발급 시 평문 1회 노출
-  - [x] `/internal` 공유 토큰 (상수 시간 비교)
-  - [x] actuator 별도 포트 분리
-  - [x] 규칙에 없는 경로는 `denyAll()`
-  - [ ] HTTPS 종단
-  - [ ] 운영자 권한을 서비스 간 토큰에서 분리
-  - [ ] 키 유효기간·회전, 요청 한도
-- [x] 소유자 격리
-  - [x] 모든 공개 조회에 소유자 조건 강제
-  - [x] 남의 문서에 403이 아니라 404
-  - [ ] 조직(tenant) 단위 확장
-- [x] 스키마 (Flyway)
+  - [x] Owner-scoped and system-scoped queries separated by name and comment
+- [x] `DocumentApplicationService` — registration and lookup
+  - [x] Size, type and content validation
+  - [x] SHA-256 checksum de-duplication (owner-scoped)
+  - [x] Re-processing on re-upload of a failed document
+- [x] OCR processing pipeline
+  - [x] `DocumentProcessingService` — claim → hand to worker pool (no transaction)
+  - [x] `DocumentTransitionService` — transitions only (`REQUIRES_NEW`)
+  - [x] Bounded queue + `AbortPolicy` backpressure
+  - [x] No exception ever leaves a document in `PROCESSING`
+- [x] `OcrEngine` port
+  - [x] `TesseractOcrEngine` adapter
+  - [x] `StubOcrEngine` — for environments without the native library
+  - [ ] Word-level confidence from Tesseract
+  - [ ] Image preprocessing (binarisation, deskew)
+  - [ ] Per-page PDF processing
+- [x] `DocumentStorage` port
+  - [x] `LocalFileSystemDocumentStorage` — date-based keys, path escape blocked
+  - [ ] S3 adapter
+- [x] Upload type verification
+  - [x] Magic bytes (PNG / JPEG / TIFF / PDF)
+  - [x] PDF encryption check and page limit
+- [x] Authentication and authorisation
+  - [x] API keys — SHA-256 hash stored, plaintext shown once at issue
+  - [x] `/internal` shared token (constant-time comparison)
+  - [x] Actuator on a separate port
+  - [x] `denyAll()` for uncovered paths
+  - [ ] HTTPS termination
+  - [ ] Separate operator rights from the service-to-service token
+  - [ ] Key expiry and rotation, rate limiting
+- [x] Owner isolation
+  - [x] Owner condition enforced on every public query
+  - [x] 404 instead of 403 for someone else's document
+  - [ ] Organisation (tenant) level
+- [x] Schema (Flyway)
   - [x] `V1` documents / `V2` owner / `V3` api_keys
-  - [ ] `NEEDS_REVIEW` 상태와 신뢰도 기반 품질 게이트
-- [x] 테스트
-  - [x] 도메인 상태 전이
-  - [x] 스토리지 어댑터 (경로 이탈 차단 포함)
-  - [x] 접수 규칙 (큐 포화 시 선점 해제)
-  - [x] 형식 검증 (위장 파일 차단)
-  - [x] 인증 (세 갈래)
-  - [x] 소유자 격리
-  - [x] 파이프라인 통합 (업로드 → 접수 → 비동기 처리 → 조회)
+  - [ ] `NEEDS_REVIEW` status and a confidence-based quality gate
+- [x] Tests
+  - [x] Domain state transitions
+  - [x] Storage adapter (including path escape)
+  - [x] Acceptance rules (release claim on a full queue)
+  - [x] Type verification (disguised files rejected)
+  - [x] Authentication (all three lanes)
+  - [x] Owner isolation
+  - [x] Pipeline integration (upload → accept → async processing → query)
 
 <br>
 
-## 📤 실행 결과
+## 📤 Results
 
-### 업로드 성공
+> Messages are in Korean because they come straight from the service code.
 
-**요청**
+### Upload succeeds
+
+**Request**
 
 ```bash
 curl -H "X-API-Key: ocrk_nRXV7l5..." -F "file=@scan.png" \
      http://localhost:8080/api/v1/documents
 ```
 
-**응답** `201 Created`
+**Response** `201 Created`
 
 ```json
 {
@@ -246,22 +254,23 @@ curl -H "X-API-Key: ocrk_nRXV7l5..." -F "file=@scan.png" \
 }
 ```
 
-### 처리 접수 — 기다리지 않는다
+### Acceptance — it doesn't wait
 
 ```bash
 curl -X POST -H "X-Internal-Token: ..." \
      "http://localhost:8080/internal/v1/ocr/process-pending?batchSize=25"
 ```
 
-**응답** `202 Accepted` — 25건 접수에 **0.15초**
+**Response** `202 Accepted` — 25 documents accepted in **0.15 s**
 
 ```json
 { "queued": 25, "rejected": 0, "skipped": 0 }
 ```
 
-`queued`는 큐에 넣은 수일 뿐 성공한 수가 아니다. 실제 결과는 문서 상태로 확인한다.
+`queued` counts what went into the queue, not what succeeded. The real outcome shows
+up in the document status.
 
-### 처리 완료 후 조회
+### After processing
 
 ```json
 {
@@ -281,44 +290,44 @@ curl -X POST -H "X-Internal-Token: ..." \
 }
 ```
 
-### 인증 실패 — 키가 없음
+### Authentication fails — no key
 
 ```json
 { "code": "UNAUTHORIZED", "message": "유효한 인증 정보가 필요합니다", "timestamp": "..." }
 ```
 
-### 형식을 속인 업로드
+### A disguised upload
 
-셸 스크립트를 `.png`로 바꾸고 `Content-Type: image/png`로 보낸 경우.
+A shell script renamed to `.png` and sent as `Content-Type: image/png`.
 
 ```json
 { "code": "CONTENT_MISMATCH", "message": "파일 내용이 image/png 형식이 아닙니다", "timestamp": "..." }
 ```
 
-JPEG를 PNG로 위장한 경우 — **실제 형식까지 알려준다.**
+A JPEG disguised as a PNG — **the real type is named.**
 
 ```json
 { "code": "CONTENT_MISMATCH", "message": "파일 내용이 image/png 형식이 아닙니다 (실제: image/jpeg)", "timestamp": "..." }
 ```
 
-`%PDF-`로 시작하지만 내용이 깨진 경우.
+Starts with `%PDF-` but the content is broken.
 
 ```json
 { "code": "CONTENT_MISMATCH", "message": "PDF 를 읽을 수 없습니다: 손상되었거나 암호화된 파일입니다", "timestamp": "..." }
 ```
 
-### 남의 문서 조회 — 404
+### Someone else's document — 404
 
 ```json
 { "code": "DOCUMENT_NOT_FOUND", "message": "문서를 찾을 수 없습니다: e04fb648-...", "timestamp": "..." }
 ```
 
-없는 문서를 조회했을 때와 응답이 구분되지 않는다. 403은 "그 문서가 존재한다"는
-사실을 알려주는 셈이라 그 자체로 정보가 샌다.
+Indistinguishable from querying a document that doesn't exist. A 403 would tell the
+caller that the document *does* exist, which is itself a leak.
 
 <br>
 
-## 🏗 아키텍처
+## 🏗 Architecture
 
 ```mermaid
 sequenceDiagram
@@ -334,185 +343,185 @@ sequenceDiagram
 
     C->>B: POST /api/v1/documents (multipart)
     B->>S: upload()
-    S->>S: 매직 바이트 검증
+    S->>S: verify magic bytes
     S->>ST: store() → storageKey
     S-->>C: 201 PENDING
 
     SCH->>P: POST /internal/v1/ocr/process-pending
-    P->>T: claim() ── 짧은 트랜잭션
-    P->>W: 워커 풀에 위임
-    P-->>SCH: 202 { queued, rejected } ── 즉시 반환
+    P->>T: claim() ── short transaction
+    P->>W: hand to worker pool
+    P-->>SCH: 202 { queued, rejected } ── returns at once
     W->>ST: read(storageKey)
-    W->>E: extract() ── 워커 스레드, 트랜잭션 밖 (느림)
-    W->>T: complete() / fail() ── 짧은 트랜잭션
+    W->>E: extract() ── worker thread, outside a transaction (slow)
+    W->>T: complete() / fail() ── short transaction
 
     C->>B: GET /api/v1/documents/{id}/text
-    B-->>C: 추출된 텍스트
+    B-->>C: extracted text
 ```
 
 ```
 com.ocr.automation.backend
 ├── document/
-│   ├── domain/          Document(상태 머신), DocumentStatus, OcrResult
-│   ├── repository/      소유자 범위 / 시스템 범위로 분리
+│   ├── domain/          Document (state machine), DocumentStatus, OcrResult
+│   ├── repository/      split into owner-scoped and system-scoped
 │   ├── service/
-│   │   ├── DocumentApplicationService    # 등록·조회 (HTTP/OCR을 모름)
-│   │   ├── DocumentProcessingService     # 접수 오케스트레이터 (트랜잭션 없음)
-│   │   └── DocumentTransitionService     # 상태 전이 전용 (짧은 트랜잭션)
-│   ├── validation/      매직 바이트 + PDF 검사
-│   └── web/             Controller + DTO + ExceptionHandler (어댑터)
+│   │   ├── DocumentApplicationService    # registration/lookup (knows no HTTP or OCR)
+│   │   ├── DocumentProcessingService     # acceptance orchestrator (no transaction)
+│   │   └── DocumentTransitionService     # transitions only (short transactions)
+│   ├── validation/      magic bytes + PDF inspection
+│   └── web/             Controller + DTO + ExceptionHandler (adapter)
 ├── ocr/
-│   ├── OcrEngine.java                    # 포트
-│   ├── tesseract/TesseractOcrEngine      # 어댑터
-│   └── stub/StubOcrEngine                # 네이티브 없는 환경용
+│   ├── OcrEngine.java                    # port
+│   ├── tesseract/TesseractOcrEngine      # adapter
+│   └── stub/StubOcrEngine                # for environments without the native library
 ├── storage/
-│   ├── DocumentStorage.java              # 포트
+│   ├── DocumentStorage.java              # port
 │   └── local/LocalFileSystemDocumentStorage
-├── owner/DocumentOwnerResolver.java      # 포트
+├── owner/DocumentOwnerResolver.java      # port
 ├── security/
-│   ├── SecurityConfig.java               # 세 갈래 인가 규칙
-│   ├── ApiKeyAuthenticationFilter        # 공개 API
-│   ├── InternalTokenAuthenticationFilter # 서비스 간
-│   └── apikey/                           # ApiKey 도메인 + 발급·검증
+│   ├── SecurityConfig.java               # the three authorisation lanes
+│   ├── ApiKeyAuthenticationFilter        # public API
+│   ├── InternalTokenAuthenticationFilter # service-to-service
+│   └── apikey/                           # ApiKey domain + issue/verify
 └── config/
 ```
 
-### 왜 서비스가 셋인가
+### Why three services
 
-| 클래스 | 트랜잭션 | 역할 |
+| Class | Transaction | Role |
 |---|---|---|
-| `DocumentApplicationService` | 있음 | 등록·조회. 짧고 단순 |
-| `DocumentProcessingService` | **없음** | 선점 → 워커 풀 위임 순서만 잡는다 |
-| `DocumentTransitionService` | `REQUIRES_NEW` | 상태 전이만. 커넥션을 오래 잡지 않는다 |
+| `DocumentApplicationService` | yes | Registration and lookup. Short and simple |
+| `DocumentProcessingService` | **none** | Only orders claim → hand to worker pool |
+| `DocumentTransitionService` | `REQUIRES_NEW` | Transitions only. Never holds a connection long |
 
-OCR은 수 초에서 수십 초가 걸린다. 한 트랜잭션 안에서 돌리면 커넥션 풀이 금방 마른다.
-전이 메서드를 같은 클래스에 두면 **프록시를 타지 않아 트랜잭션이 분리되지 않으므로**
-별도 빈으로 뺐다.
+OCR takes seconds to tens of seconds. Run inside one transaction, the connection pool
+dries up fast. Keeping the transition methods in the same class would mean
+**no proxy and therefore no separate transaction**, so they live in their own bean.
 
 <br>
 
-## 🛠 기술 스택
+## 🛠 Tech Stack
 
-| 영역 | 기술 |
+| Area | Technology |
 |---|---|
-| 언어 | Java 21 |
-| 프레임워크 | Spring Boot 3.5.16 |
-| 인증 | Spring Security (API 키 / 공유 토큰) |
-| 설정 | Spring Cloud Config Client (2025.0.3) |
-| 영속성 | Spring Data JPA, PostgreSQL(운영) / H2(로컬·테스트) |
-| 마이그레이션 | Flyway |
+| Language | Java 21 |
+| Framework | Spring Boot 3.5.16 |
+| Authentication | Spring Security (API key / shared token) |
+| Configuration | Spring Cloud Config Client (2025.0.3) |
+| Persistence | Spring Data JPA, PostgreSQL (production) / H2 (local, test) |
+| Migration | Flyway |
 | OCR | Tesseract via tess4j 5.20.0 |
-| PDF 검사 | Apache PDFBox |
-| 빌드 | Gradle 8.14.3 |
+| PDF inspection | Apache PDFBox |
+| Build | Gradle 8.14.3 |
 
 <br>
 
-## 🏃 실행 방법
+## 🏃 Getting Started
 
-**설정 서버가 먼저 떠 있어야 한다.** 포트·DB·스토리지 설정을
-[ocr-config-server](https://github.com/hyunolike/ai.ocr-automation.system-config.server)에서 내려받는다.
+**The config server has to be up first.** Port, database and storage settings come from
+[ocr-config-server](https://github.com/hyunolike/ai.ocr-automation.system-config.server).
 
 ```bash
-# 1. 설정 서버 (별도 터미널, 8888)
+# 1. Config server (separate terminal, 8888)
 cd ../ai.ocr-automation.system-config.server && ./gradlew bootRun
 
-# 2. 백엔드 (local 프로파일 = H2 + stub 엔진)
+# 2. Backend (local profile = H2 + stub engine)
 ./gradlew bootRun
 ```
 
 ```bash
-TOKEN=local-dev-only-token   # 개발 기본값
+TOKEN=local-dev-only-token   # development default
 
-# 3. API 키 발급
+# 3. Issue an API key
 KEY=$(curl -sS -X POST http://localhost:8080/internal/v1/api-keys \
         -H "X-Internal-Token: $TOKEN" -H "Content-Type: application/json" \
-        -d '{"ownerId":"demo","label":"로컬"}' | jq -r .key)
+        -d '{"ownerId":"demo","label":"local"}' | jq -r .key)
 
-# 4. 업로드
+# 4. Upload
 curl -H "X-API-Key: $KEY" -F "file=@scan.png" http://localhost:8080/api/v1/documents
 
-# 5. 처리 접수 (평소엔 스케줄러가 호출한다)
+# 5. Accept for processing (normally the scheduler's job)
 curl -X POST -H "X-Internal-Token: $TOKEN" \
      http://localhost:8080/internal/v1/ocr/process-pending
 
-# 6. 결과
+# 6. Result
 curl -H "X-API-Key: $KEY" http://localhost:8080/api/v1/documents/{id}/text
 ```
 
-| 항목 | 주소 |
+| Item | Address |
 |---|---|
 | API | `http://localhost:8080/api/v1/documents` |
-| H2 콘솔 (local) | `http://localhost:8080/h2-console` (JDBC `jdbc:h2:mem:ocrdb`, user `sa`) |
-| 헬스체크 | `http://localhost:9080/actuator/health` (관리 전용 포트) |
+| H2 console (local) | `http://localhost:8080/h2-console` (JDBC `jdbc:h2:mem:ocrdb`, user `sa`) |
+| Health check | `http://localhost:9080/actuator/health` (management port) |
 
-### 테스트
+### Tests
 
 ```bash
 ./gradlew test
 ```
 
-| 테스트 | 검증 대상 |
+| Test | What it covers |
 |---|---|
-| `DocumentTest` | 상태 전이 규칙 (재시도, 정체 판정, 잘못된 전이 차단) |
-| `LocalFileSystemDocumentStorageTest` | 키 생성, 경로 조작 차단, 파일명 충돌 |
-| `DocumentProcessingServiceTest` | 접수 규칙 — 큐 포화 시 선점 해제, 재시도 횟수 미증가 |
-| `ContentTypeVerificationTest` | 형식 검증 — 위장 파일 차단, 손상·과길이 PDF |
-| `AuthenticationTest` | 세 갈래 인증 — 키 누락·오류·폐기, 권한 교차, 미매핑 경로 |
-| `DocumentOwnerIsolationTest` | 소유자 격리 — 남의 문서 차단, 소유자별 중복 판정 |
-| `DocumentPipelineIntegrationTest` | 업로드 → 접수 → 비동기 처리 → 조회 HTTP 왕복 |
+| `DocumentTest` | Transition rules (retries, stall detection, invalid transitions blocked) |
+| `LocalFileSystemDocumentStorageTest` | Key generation, path traversal, filename collisions |
+| `DocumentProcessingServiceTest` | Acceptance rules — release the claim on a full queue, don't count it as a retry |
+| `ContentTypeVerificationTest` | Type verification — disguised files, corrupt and oversized PDFs |
+| `AuthenticationTest` | Three lanes — missing/wrong/revoked key, crossed privileges, unmapped paths |
+| `DocumentOwnerIsolationTest` | Owner isolation — other owners' documents, per-owner de-duplication |
+| `DocumentPipelineIntegrationTest` | Upload → accept → async processing → query over HTTP |
 
-> 테스트는 **Flyway로 스키마를 만들고 JPA는 `validate`만** 한다.
-> 엔티티와 마이그레이션이 어긋나면 기동 단계에서 깨진다.
+> Tests **build the schema with Flyway and let JPA only `validate`.**
+> An entity and a migration that drift apart break startup.
 
 <br>
 
-## 🤔 설계하며 고민한 점
+## 🤔 Design Decisions
 
-| 주제 | 선택 | 이유 |
+| Topic | Choice | Why |
 |---|---|---|
-| 처리 방식 | 동기 처리 대신 접수 + 워커 풀 | `배치 크기 × 건당 소요`가 호출자 타임아웃을 넘긴다. 요청이 끊긴 뒤에도 처리는 돌아 다음 주기와 겹친다 |
-| 백프레셔 | 바운드 큐 + `AbortPolicy` | `CallerRunsPolicy`는 HTTP 스레드가 OCR을 대신 돌게 해 타임아웃 문제를 되살린다 |
-| 큐 거부 시 | `fail()`이 아니라 `releaseClaim()` | 큐가 붐빈 것은 문서의 잘못이 아니다. 실패로 세면 멀쩡한 문서가 `FAILED`로 밀려난다 |
-| 작업 유실 | 인메모리 큐 + 정체 회수 | 죽으면 대기 작업이 사라지지만, 그 문서는 `PROCESSING`이라 회수 잡이 이미 걷어간다 |
-| 엔진 교체 | 포트 + `@ConditionalOnProperty` | stub 엔진 덕에 네이티브 없이 파이프라인 전체를 테스트할 수 있다 |
-| 스토리지 반환값 | 경로가 아닌 **스토리지 키** | S3로 옮길 때 도메인과 서비스가 바뀌지 않는다 |
-| 형식 검증 | Tika 대신 매직 바이트 직접 구현 | 허용 형식이 넷뿐인데 Tika는 수백 형식을 위해 의존성과 기동 시간을 가져온다 |
-| PDF 검사 시점 | 업로드 시점 | 통과시키면 OCR 단계에서야 드러난다. 그때는 워커와 재시도 한도를 이미 낭비한 뒤다 |
-| API 키 해시 | bcrypt 대신 SHA-256 | 느린 해시는 저엔트로피 비밀번호용이다. 256비트 난수에는 불필요하고, 요청마다 도는 검증에 지연만 더한다 |
-| 토큰 비교 | `MessageDigest.isEqual` | `String.equals`는 첫 불일치에서 멈춰 응답 시간으로 한 글자씩 알아낼 수 있다 |
-| 인가 기본값 | `anyRequest().denyAll()` | 규칙을 빠뜨리면 열리는 것이 아니라 막힌다. 실수로 열리는 쪽보다 낫다 |
-| 남의 문서 | 403이 아니라 404 | 403은 그 문서가 존재한다는 사실을 알려준다 |
-| 중복 판정 | 전역이 아닌 소유자 범위 | 전역이면 같은 파일을 올린 남의 문서 ID를 돌려받는다 |
-| 스키마 출처 | Flyway 하나, JPA는 `validate` | 로컬도 H2를 PostgreSQL 모드로 띄워 같은 마이그레이션을 돌린다. 불일치가 운영 전에 드러난다 |
+| Processing model | Acceptance + worker pool instead of synchronous processing | `batch size × per-document time` exceeds the caller's timeout. Processing keeps running after the request is cut and overlaps the next tick |
+| Backpressure | Bounded queue + `AbortPolicy` | `CallerRunsPolicy` makes the HTTP thread run OCR, reviving the very timeout problem |
+| Queue refusal | `releaseClaim()`, not `fail()` | A busy queue isn't the document's fault. Counting it as failure pushes healthy documents to `FAILED` |
+| Lost work | In-memory queue + stall recovery | On a crash, queued work is gone — but those documents are `PROCESSING`, and the recovery job already collects them |
+| Engine swap | Port + `@ConditionalOnProperty` | The stub engine lets the whole pipeline be tested without the native library |
+| Storage return value | A **storage key**, not a path | Moving to S3 leaves the domain and services unchanged |
+| Type verification | Magic bytes by hand, not Tika | Only four types are allowed; Tika brings dependencies and startup time for hundreds |
+| PDF inspection timing | At upload | Let it through and it surfaces during OCR — after a worker and the retry budget have already been spent |
+| API key hashing | SHA-256, not bcrypt | Slow hashes protect low-entropy passwords. A 256-bit random needs none, and per-request verification only gains latency |
+| Token comparison | `MessageDigest.isEqual` | `String.equals` stops at the first mismatch, letting timing reveal one character at a time |
+| Authorisation default | `anyRequest().denyAll()` | A missing rule closes the path rather than opening it. Better than failing open |
+| Someone else's document | 404, not 403 | A 403 confirms the document exists |
+| De-duplication | Owner-scoped, not global | Global scope hands back another owner's document id for the same file |
+| Schema source | Flyway alone; JPA `validate` | Local runs H2 in PostgreSQL mode against the same migrations, so drift shows up before production |
 
 <br>
 
-## ⚠️ 알려진 단순화
+## ⚠️ Known Simplifications
 
-초기 구조 단계로 의도적으로 남겨둔 부분이다. 실전 적용 전에 반드시 해소해야 한다.
+Deliberately left out at this scaffolding stage. Each has to be resolved before real use.
 
-- **HTTPS가 없다** — API 키와 내부 토큰이 평문으로 오간다. 신뢰할 수 없는 구간을 지난다면 TLS 종단이 필수다.
-- **키 발급 권한이 서비스 간 토큰과 같다** — 스케줄러가 쓰는 토큰으로 키도 발급할 수 있다. 운영자 권한을 따로 두어야 한다.
-- **`/internal`이 공개 포트에 열려 있다** — 토큰으로 막혀 있지만 경로 자체는 8080에 노출된다. 방화벽·인그레스 차단이 1차 방어다.
-- **키 만료가 없다** — 폐기는 수동이며 유효기간이 없다. 회전 정책이 필요하다.
-- **요청 한도가 없다** — 키 하나로 무제한 호출할 수 있다.
-- **파일 전체를 메모리에 올린다** — 20MB 제한으로 버티지만, 큰 파일을 다루려면 스트리밍이 필요하다.
-- **Tesseract 신뢰도를 수집하지 않는다** — `confidence`가 항상 `null`이다. 품질 게이트를 만들 수 없다.
-- **PDF 페이지 수를 세지 않는다** — 검증 때는 세지만 결과의 `pageCount`는 `null`이다.
-- **정체 회수가 시간 기준뿐이다** — 처리가 오래 걸리는 정상 문서도 회수될 수 있다. heartbeat 갱신이 있어야 정확하다.
-- **원본 문서를 지우지 않는다** — 처리가 끝나도 파일이 계속 쌓인다. 보관 기간 정책이 필요하다.
-- **로컬 파일시스템은 스케일아웃이 안 된다** — 인스턴스를 늘리면 다른 인스턴스가 저장한 파일을 읽지 못한다.
+- **No HTTPS** — the API key and internal token travel in the clear. TLS termination is mandatory across untrusted networks.
+- **Key issuance shares the service-to-service token** — the scheduler's token can also mint keys. Operator rights need to be separate.
+- **`/internal` is exposed on the public port** — the token guards it, but the path is still reachable on 8080. Firewall and ingress rules are the first defence.
+- **Keys never expire** — revocation is manual and there is no lifetime. A rotation policy is needed.
+- **No rate limiting** — one key can call without bound.
+- **The whole file is held in memory** — the 20 MB cap makes that survivable, but larger files need streaming.
+- **Tesseract confidence isn't collected** — `confidence` is always `null`, so no quality gate is possible.
+- **PDF pages aren't counted in the result** — verification counts them, but `pageCount` stays `null`.
+- **Stall recovery is time-based only** — a legitimately slow document can be reclaimed. Heartbeat updates would make it precise.
+- **Originals are never deleted** — files pile up after processing. A retention policy is needed.
+- **A local filesystem doesn't scale out** — add instances and they can't read each other's files.
 
 <br>
 
-## 🗺 앞으로 구현할 것
+## 🗺 Roadmap
 
-- [ ] HTTPS 종단, 운영자 권한 분리, 키 유효기간·회전, 요청 한도
-- [ ] 컨테이너 이미지 (tesseract는 이 서비스 이미지에만) + CI
-- [ ] 관측성 — 대기 문서 수, 처리 시간, 큐 포화, 회수 건수
-- [ ] 이미지 전처리 (해상도 정규화·이진화·기울기 보정)
-- [ ] Tesseract 단어 단위 신뢰도 수집 + `NEEDS_REVIEW` 상태
-- [ ] PDF 페이지 단위 처리 (텍스트 레이어가 있으면 OCR 생략)
-- [ ] S3 스토리지 어댑터 (포트는 그대로)
-- [ ] 문서 보관 기간 정책과 정리 배치
-- [ ] 추출 텍스트에서 구조화 필드 뽑기
+- [ ] HTTPS termination, operator rights separation, key expiry and rotation, rate limiting
+- [ ] Container image (Tesseract only in this service's image) + CI
+- [ ] Observability — pending count, processing time, queue saturation, recovery count
+- [ ] Image preprocessing (resolution normalisation, binarisation, deskew)
+- [ ] Word-level Tesseract confidence + a `NEEDS_REVIEW` status
+- [ ] Per-page PDF processing (skip OCR when a text layer exists)
+- [ ] S3 storage adapter (port unchanged)
+- [ ] Retention policy and a cleanup job
+- [ ] Structured field extraction from the recognised text
