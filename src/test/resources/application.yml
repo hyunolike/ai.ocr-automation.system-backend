@@ -1,0 +1,31 @@
+# 테스트는 설정 서버 없이 독립적으로 돈다.
+spring:
+  cloud:
+    config:
+      enabled: false
+  datasource:
+    url: jdbc:h2:mem:ocrtest;MODE=PostgreSQL;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  jpa:
+    hibernate:
+      # 운영과 같은 방식으로 검증한다: 스키마는 Flyway 가 만들고 JPA 는 맞는지 확인만 한다.
+      # 엔티티와 V1__create_documents.sql 이 어긋나면 테스트가 기동 단계에서 깨진다.
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+
+ocr:
+  storage:
+    base-path: ${java.io.tmpdir}/ocr-test-storage
+  engine:
+    type: stub
+  processing:
+    max-retries: 3
+    stale-after-minutes: 10
+
+logging:
+  level:
+    org.hibernate.tool.schema: WARN
