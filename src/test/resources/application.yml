@@ -25,6 +25,9 @@ ocr:
   processing:
     max-retries: 3
     stale-after-minutes: 10
+    # 테스트는 동시성을 고정해 결과를 예측 가능하게 만든다
+    concurrency: 2
+    queue-capacity: 20
 
 logging:
   level:

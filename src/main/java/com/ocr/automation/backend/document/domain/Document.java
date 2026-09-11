@@ -148,6 +148,41 @@ public class Document {
     }
 
     /**
+     * 선점을 되돌린다. 처리에 착수하지 못하고 반납하는 경우에만 쓴다.
+     *
+     * <p>{@link #fail} 과 달리 <b>재시도 횟수를 올리지 않는다.</b>
+     * 워커 큐가 가득 차 작업을 받지 못한 것은 문서의 잘못이 아니므로,
+     * 이것을 실패로 세면 큐가 붐빌 때마다 멀쩡한 문서가 FAILED 로 밀려난다.
+     */
+    public void releaseClaim() {
+        if (status != DocumentStatus.PROCESSING) {
+            throw new IllegalStateException(
+                    "처리 중인 문서가 아닙니다: publicId=%s, status=%s".formatted(publicId, status));
+        }
+        this.status = DocumentStatus.PENDING;
+        this.processingStartedAt = null;
+    }
+
+    /**
+     * 실패로 확정된 문서를 다시 처리 대기로 되돌린다.
+     * 같은 파일을 다시 업로드했을 때 "이미 있는 문서"로 끝나지 않게 하기 위한 것이다.
+     *
+     * <p>재시도 횟수를 0 으로 되돌린다. 사용자의 재업로드는 새로운 시도이지
+     * 이전 실패의 연장이 아니다.
+     */
+    public void resetForRetry() {
+        if (status != DocumentStatus.FAILED) {
+            throw new IllegalStateException(
+                    "실패한 문서가 아닙니다: publicId=%s, status=%s".formatted(publicId, status));
+        }
+        this.status = DocumentStatus.PENDING;
+        this.retryCount = 0;
+        this.failureReason = null;
+        this.processingStartedAt = null;
+        this.finishedAt = null;
+    }
+
+    /**
      * 처리 도중 인스턴스가 죽어 PROCESSING 에 멈춘 문서를 회수한다.
      * 실패와 같은 규칙으로 재시도 여유를 판단한다.
      */

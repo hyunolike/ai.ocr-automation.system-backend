@@ -35,8 +35,11 @@ public class DocumentApplicationService {
     /**
      * 문서를 저장하고 OCR 대기열(PENDING)에 올린다.
      *
-     * <p>같은 내용(체크섬 일치)의 문서가 이미 있으면 새로 저장하지 않고
-     * 기존 문서를 돌려준다. 스토리지에 같은 파일이 쌓이는 것을 막는다.
+     * <p>같은 내용(체크섬 일치)의 문서가 이미 있으면 새로 저장하지 않고 기존 문서를
+     * 돌려준다. 스토리지에 같은 파일이 쌓이는 것을 막는다.
+     *
+     * <p>단 기존 문서가 {@code FAILED} 라면 다시 대기열에 올린다. 그러지 않으면
+     * 사용자가 실패한 문서를 다시 올려도 아무 일도 일어나지 않는다.
      */
     @Transactional
     public Document upload(String originalFilename, String contentType, byte[] content) {
@@ -45,9 +48,7 @@ public class DocumentApplicationService {
         String checksum = sha256(content);
         Optional<Document> existing = documentRepository.findFirstByChecksumOrderByUploadedAtDesc(checksum);
         if (existing.isPresent()) {
-            log.info("동일한 문서가 이미 등록되어 있습니다: publicId={}, checksum={}",
-                    existing.get().getPublicId(), checksum);
-            return existing.get();
+            return reuse(existing.get(), checksum);
         }
 
         String storageKey = documentStorage.store(originalFilename, content);
@@ -57,6 +58,22 @@ public class DocumentApplicationService {
         log.info("문서 등록: publicId={}, filename={}, size={}",
                 saved.getPublicId(), originalFilename, content.length);
         return saved;
+    }
+
+    /**
+     * 이미 등록된 같은 내용의 문서를 재사용한다.
+     * 실패로 끝난 문서였다면 재처리 대기로 되돌린다.
+     */
+    private Document reuse(Document existing, String checksum) {
+        if (existing.getStatus() == DocumentStatus.FAILED) {
+            existing.resetForRetry();
+            log.info("실패했던 문서를 다시 대기열에 올립니다: publicId={}, checksum={}",
+                    existing.getPublicId(), checksum);
+            return existing;
+        }
+        log.info("동일한 문서가 이미 등록되어 있습니다: publicId={}, status={}, checksum={}",
+                existing.getPublicId(), existing.getStatus(), checksum);
+        return existing;
     }
 
     @Transactional(readOnly = true)

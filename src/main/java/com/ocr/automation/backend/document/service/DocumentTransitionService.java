@@ -57,6 +57,18 @@ public class DocumentTransitionService {
         }
     }
 
+    /**
+     * 선점을 되돌린다. 워커 큐가 가득 차 처리에 착수하지 못한 경우에 쓴다.
+     * 재시도 횟수를 올리지 않으므로 {@link #fail} 과 구분된다.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void releaseClaim(Long documentId) {
+        Document document = documentRepository.findById(documentId)
+                .orElseThrow(() -> new IllegalStateException("문서가 사라졌습니다: id=" + documentId));
+        document.releaseClaim();
+        log.debug("선점 해제: publicId={}", document.getPublicId());
+    }
+
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void complete(Long documentId, OcrResult result) {
         Document document = documentRepository.findById(documentId)

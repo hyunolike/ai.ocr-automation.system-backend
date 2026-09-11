@@ -144,6 +144,69 @@ class DocumentTest {
     }
 
     @Test
+    void 선점을_해제하면_재시도_횟수를_올리지_않고_대기로_돌아간다() {
+        Document document = newDocument();
+        document.startProcessing();
+
+        document.releaseClaim();
+
+        assertThat(document.getStatus()).isEqualTo(DocumentStatus.PENDING);
+        assertThat(document.getRetryCount()).isZero();      // 큐가 붐빈 것은 문서 잘못이 아니다
+        assertThat(document.getProcessingStartedAt()).isNull();
+        assertThat(document.getFailureReason()).isNull();
+    }
+
+    @Test
+    void 처리중이_아닌_문서는_선점_해제할_수_없다() {
+        Document document = newDocument();
+
+        assertThatThrownBy(document::releaseClaim)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("처리 중인 문서가 아닙니다");
+    }
+
+    @Test
+    void 실패한_문서를_되돌리면_재시도_횟수가_초기화된다() {
+        Document document = newDocument();
+        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            document.startProcessing();
+            document.fail("엔진 오류", MAX_RETRIES);
+        }
+        assertThat(document.getStatus()).isEqualTo(DocumentStatus.FAILED);
+
+        document.resetForRetry();
+
+        assertThat(document.getStatus()).isEqualTo(DocumentStatus.PENDING);
+        assertThat(document.getRetryCount()).isZero();      // 재업로드는 새로운 시도다
+        assertThat(document.getFailureReason()).isNull();
+        assertThat(document.getFinishedAt()).isNull();
+    }
+
+    @Test
+    void 되돌린_문서는_다시_처리할_수_있다() {
+        Document document = newDocument();
+        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            document.startProcessing();
+            document.fail("엔진 오류", MAX_RETRIES);
+        }
+
+        document.resetForRetry();
+        document.startProcessing();
+        document.completeWith(sampleResult());
+
+        assertThat(document.getStatus()).isEqualTo(DocumentStatus.COMPLETED);
+    }
+
+    @Test
+    void 실패하지_않은_문서는_되돌릴_수_없다() {
+        Document document = newDocument();
+
+        assertThatThrownBy(document::resetForRetry)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("실패한 문서가 아닙니다");
+    }
+
+    @Test
     void 실패_사유가_아주_길면_잘라서_보관한다() {
         Document document = newDocument();
         document.startProcessing();

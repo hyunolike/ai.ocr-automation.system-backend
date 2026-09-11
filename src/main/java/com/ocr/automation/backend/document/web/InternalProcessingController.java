@@ -1,13 +1,15 @@
 package com.ocr.automation.backend.document.web;
 
 import com.ocr.automation.backend.document.service.DocumentProcessingService;
-import com.ocr.automation.backend.document.web.dto.ProcessingSummaryResponse;
+import com.ocr.automation.backend.document.web.dto.DispatchResultResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.Map;
@@ -31,15 +33,20 @@ public class InternalProcessingController {
 
     private final DocumentProcessingService documentProcessingService;
 
-    /** 대기 중인 문서를 배치로 처리한다. */
+    /**
+     * 대기 중인 문서를 워커 풀에 <b>접수</b>한다. 처리를 기다리지 않고 즉시 반환한다.
+     *
+     * <p>그래서 202 다. 응답의 queued 는 큐에 넣은 수일 뿐 성공한 수가 아니다.
+     */
     @PostMapping("/process-pending")
-    public ProcessingSummaryResponse processPending(
+    @ResponseStatus(HttpStatus.ACCEPTED)
+    public DispatchResultResponse processPending(
             @RequestParam(defaultValue = "20") int batchSize) {
-        return ProcessingSummaryResponse.from(
+        return DispatchResultResponse.from(
                 documentProcessingService.processPending(Math.clamp(batchSize, 1, MAX_BATCH_SIZE)));
     }
 
-    /** 문서 한 건을 즉시 처리한다 (수동 재처리용). */
+    /** 문서 한 건을 동기로 처리하고 결과를 돌려준다 (수동 재처리용). */
     @PostMapping("/documents/{publicId}/process")
     public Map<String, Object> processOne(@PathVariable String publicId) {
         boolean succeeded = documentProcessingService.processOne(publicId);

@@ -11,7 +11,8 @@ OCR 자동화 시스템의 **백엔드**. 문서 업로드/조회 API 와 OCR �
 
 - **OCR 엔진을 갈아 끼울 수 있게 한다** — 비즈니스 로직은 `OcrEngine` 포트만 알고, Tesseract 는 어댑터 하나일 뿐이다
 - **스토리지를 갈아 끼울 수 있게 한다** — 로컬 FS → S3 전환이 도메인에 닿지 않게 `DocumentStorage` 포트로 끊는다
-- **느린 작업이 DB 커넥션을 잡지 않게 한다** — 상태 전이(짧은 트랜잭션)와 OCR 실행(트랜잭션 밖)을 분리한다
+- **느린 작업이 DB 커넥션도 HTTP 요청 스레드도 잡지 않게 한다** — 상태 전이(짧은 트랜잭션)와
+  OCR 실행(워커 풀, 트랜잭션 밖)을 분리한다
 - **상태 전이 규칙은 도메인이 지킨다** — setter 없이 의미 있는 메서드로만 상태를 바꾼다
 
 <br>
@@ -27,6 +28,7 @@ sequenceDiagram
     participant SCH as Scheduler
     participant P as DocumentProcessingService
     participant T as DocumentTransitionService
+    participant W as ocrExecutor
     participant E as OcrEngine
 
     C->>B: POST /api/v1/documents (multipart)
@@ -37,10 +39,12 @@ sequenceDiagram
     SCH->>P: POST /internal/v1/ocr/process-pending
     P->>T: claim() ── 짧은 트랜잭션
     T-->>P: PROCESSING 선점
-    P->>ST: read(storageKey)
-    P->>E: extract() ── 트랜잭션 밖 (느림)
-    E-->>P: OcrExtraction
-    P->>T: complete() / fail() ── 짧은 트랜잭션
+    P->>W: 워커 풀에 위임
+    P-->>SCH: 202 { queued, rejected } ── 즉시 반환
+    W->>ST: read(storageKey)
+    W->>E: extract() ── 워커 스레드, 트랜잭션 밖 (느림)
+    E-->>W: OcrExtraction
+    W->>T: complete() / fail() ── 짧은 트랜잭션
 
     C->>B: GET /api/v1/documents/{id}/text
     B-->>C: 추출된 텍스트
@@ -79,8 +83,8 @@ PENDING ──startProcessing──▶ PROCESSING ──completeWith──▶ CO
 
 | Method | Path | 설명 |
 |---|---|---|
-| `POST` | `/internal/v1/ocr/process-pending?batchSize=20` | 대기 문서 배치 처리 |
-| `POST` | `/internal/v1/ocr/documents/{id}/process` | 한 건 즉시 처리 (수동 재처리) |
+| `POST` | `/internal/v1/ocr/process-pending?batchSize=20` | 대기 문서를 워커 풀에 **접수** → `202` |
+| `POST` | `/internal/v1/ocr/documents/{id}/process` | 한 건 **동기** 처리 (수동 재처리) |
 | `POST` | `/internal/v1/ocr/recover-stalled` | 정체된 `PROCESSING` 문서 회수 |
 
 > ⚠️ `/internal` 은 **외부에 노출하면 안 된다.** 지금은 경로만 갈라두었고 인증이 없다.
@@ -135,6 +139,36 @@ com.ocr.automation.backend
 OCR 은 수 초에서 수십 초가 걸린다. 한 트랜잭션 안에서 돌리면 커넥션 풀이 금방 마른다.
 전이 메서드를 같은 클래스에 두면 **프록시를 타지 않아 트랜잭션이 분리되지 않으므로**
 별도 빈으로 뺐다.
+
+### 접수와 처리를 나눈 이유
+
+`process-pending` 은 **접수만 하고 202 로 즉시 반환한다.** 동기로 끝까지 처리하면
+`배치 크기 × 건당 소요` 가 호출자(스케줄러)의 읽기 타임아웃을 넘긴다. 그러면 요청이
+끊긴 뒤에도 처리는 계속 돌고, 다음 주기 요청과 겹친다.
+
+```
+POST /process-pending → [워커 큐 투입] → 202 { queued, rejected }
+                                          ↓ (워커 스레드)
+                                        OCR → complete/fail
+```
+
+| 설정 | 기본값 | 의미 |
+|---|---|---|
+| `ocr.processing.concurrency` | `0` (= CPU 코어 수) | 동시 OCR 수. Tesseract 는 CPU 바운드라 코어보다 많이 띄워도 처리량이 늘지 않는다 |
+| `ocr.processing.queue-capacity` | `50` | 대기 큐. **가득 차면 접수를 거부한다** |
+
+**바운드 큐 + `AbortPolicy` 가 백프레셔다.** 큐가 차면 더 선점하지 않고 `rejected` 를
+돌려준다. 남은 문서는 `PENDING` 그대로라 다음 주기에 다시 집힌다.
+
+`CallerRunsPolicy` 를 쓰면 안 된다. 호출 스레드(= HTTP 요청 스레드)가 OCR 을 대신
+돌리게 되어, 비동기로 바꾼 이유였던 타임아웃 문제가 그대로 되살아난다.
+
+큐에 넣지 못해 되돌릴 때는 `releaseClaim()` 을 쓴다. `fail()` 과 달리 **재시도 횟수를
+올리지 않는다** — 큐가 붐빈 것은 문서의 잘못이 아니고, 실패로 세면 큐가 붐빌 때마다
+멀쩡한 문서가 `FAILED` 로 밀려난다.
+
+인메모리 큐라 인스턴스가 죽으면 대기 작업이 사라진다. 하지만 그 문서들은 `PROCESSING`
+으로 선점된 상태이고 **정체 회수 잡이 이미 걷어간다** — 새로 만든 장치가 아니다.
 
 <br>
 
@@ -199,7 +233,8 @@ curl http://localhost:8080/api/v1/documents/{id}/text
 |---|---|
 | `DocumentTest` | 상태 전이 규칙 (재시도, 정체 판정, 잘못된 전이 차단) |
 | `LocalFileSystemDocumentStorageTest` | 키 생성, 경로 조작 차단, 파일명 충돌 |
-| `DocumentPipelineIntegrationTest` | 업로드 → 처리 → 조회 HTTP 왕복 |
+| `DocumentProcessingServiceTest` | 접수 규칙 — 큐 포화 시 선점 해제, 재시도 횟수 미증가 |
+| `DocumentPipelineIntegrationTest` | 업로드 → 접수 → 비동기 처리 → 조회 HTTP 왕복 |
 
 > 테스트는 **Flyway 로 스키마를 만들고 JPA 는 `validate` 만** 한다.
 > 엔티티와 `V1__create_documents.sql` 이 어긋나면 기동 단계에서 깨진다.
