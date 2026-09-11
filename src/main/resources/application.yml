@@ -10,6 +10,9 @@ spring:
     import: "configserver:${CONFIG_SERVER_URL:http://localhost:8888}"
   cloud:
     config:
+      # 설정 서버 자격증명. 부트스트랩 값이라 설정 서버로 내려받을 수 없다(닭과 달걀).
+      username: ${CONFIG_USER:ocr}
+      password: ${CONFIG_PASSWORD:local-dev-only-password}
       # 설정을 못 받으면 잘못된 기본값으로 뜨는 대신 기동에 실패한다
       fail-fast: true
       retry:

@@ -70,15 +70,14 @@ PENDING ──startProcessing──▶ PROCESSING ──completeWith──▶ CO
 
 ### 공개 API
 
-모든 공개 API 는 **소유자 헤더**를 요구한다.
+모든 공개 API 는 **API 키**를 요구한다.
 
 ```
-X-Owner-Id: <소유자 식별자>
+X-API-Key: ocrk_...
+Authorization: Bearer ocrk_...   # 둘 다 받는다
 ```
 
-> ⚠️ **이 헤더는 인증이 아니다.** 누구나 마음대로 보낼 수 있다. 지금은 소유자 *격리*를
-> 먼저 세우기 위한 자리표시자이며, Phase 1.3 에서 API Key 해석으로 교체한다.
-> 그전까지 이 서비스를 신뢰할 수 없는 네트워크에 노출해서는 안 된다.
+키가 소유자를 결정한다. 요청 어디에도 소유자를 지정하는 자리가 없다.
 
 | Method | Path | 설명 |
 |---|---|---|
@@ -92,13 +91,24 @@ X-Owner-Id: <소유자 식별자>
 
 ### 내부 API (스케줄러 전용)
 
+공유 토큰을 요구한다.
+
+```
+X-Internal-Token: <토큰>
+```
+
 | Method | Path | 설명 |
 |---|---|---|
 | `POST` | `/internal/v1/ocr/process-pending?batchSize=20` | 대기 문서를 워커 풀에 **접수** → `202` |
 | `POST` | `/internal/v1/ocr/documents/{id}/process` | 한 건 **동기** 처리 (수동 재처리) |
 | `POST` | `/internal/v1/ocr/recover-stalled` | 정체된 `PROCESSING` 문서 회수 |
 
-> ⚠️ `/internal` 은 **외부에 노출하면 안 된다.** 지금은 경로만 갈라두었고 인증이 없다.
+| `POST` | `/internal/v1/api-keys` | API 키 발급 (평문은 이 응답에서만) |
+| `GET` | `/internal/v1/api-keys?ownerId=` | 키 목록 (평문·해시 미포함) |
+| `DELETE` | `/internal/v1/api-keys/{prefix}` | 키 폐기 |
+
+> ⚠️ 토큰은 **2차 방어**다. 1차는 네트워크다 — `/internal` 은 방화벽이나 인그레스에서
+> 외부에 닿지 않게 막아야 한다.
 
 ### 오류 응답
 
@@ -108,7 +118,8 @@ X-Owner-Id: <소유자 식별자>
 
 | code | HTTP | 상황 |
 |---|---|---|
-| `OWNER_REQUIRED` | 400 | `X-Owner-Id` 헤더 누락·공백·과길이 |
+| `UNAUTHORIZED` | 401 | API 키 누락·오류·폐기됨 (내부 API 는 토큰 누락·오류) |
+| `FORBIDDEN` | 403 | 인증은 됐으나 그 경로의 권한이 아님 (예: API 키로 `/internal` 호출) |
 | `DOCUMENT_NOT_FOUND` | 404 | 없는 문서, **또는 남의 문서** |
 | `INVALID_DOCUMENT` | 400 | 형식·크기 위반, 결과가 아직 없음, 처리 대기 상태가 아님 |
 | `FILE_TOO_LARGE` | 413 | 업로드 크기 초과 |
@@ -138,8 +149,12 @@ com.ocr.automation.backend
 │   ├── DocumentStorage.java              # 포트
 │   └── local/LocalFileSystemDocumentStorage
 ├── owner/
-│   ├── DocumentOwnerResolver.java        # 포트 — 1.3 인증이 갈아끼울 자리
-│   └── header/HeaderDocumentOwnerResolver # 임시 구현 (인증 아님)
+│   └── DocumentOwnerResolver.java        # 포트
+├── security/
+│   ├── SecurityConfig.java               # 세 갈래 인가 규칙
+│   ├── ApiKeyAuthenticationFilter        # 공개 API
+│   ├── InternalTokenAuthenticationFilter # 서비스 간
+│   └── apikey/                           # ApiKey 도메인 + 발급·검증 + 소유자 해석
 └── config/
 ```
 
@@ -240,11 +255,53 @@ public interface DocumentOwnerResolver {
 }
 ```
 
-현재 구현은 `X-Owner-Id` 헤더를 읽는 자리표시자다. Phase 1.3 에서 API Key 를
-해석하는 구현으로 바꿔 끼우면 **서비스와 도메인은 손대지 않는다.**
+현재 구현은 인증된 API 키에서 소유자를 꺼낸다. 포트를 둔 덕에 이전의 헤더 구현에서
+여기로 넘어오는 데 **바뀐 것은 구현체 하나뿐**이었다 — 서비스도 도메인도 손대지 않았다.
 
-기본 소유자를 두지 않은 이유: 헤더가 없을 때 조용히 기본값으로 떨어지면 인증을 붙이지
-않은 채로도 시스템이 그럭저럭 돌아가 보이고, 그 상태가 운영까지 따라가기 쉽다.
+<br>
+
+## 🔐 인증
+
+세 갈래를 각각 다른 수단으로 막는다.
+
+| 경로 | 수단 | 주체 |
+|---|---|---|
+| `/api/**` | API 키 | 외부 클라이언트 |
+| `/internal/**` | 공유 토큰 | 스케줄러 |
+| actuator | 별도 포트(9080) | 운영 |
+
+그 밖의 경로는 **모두 거절한다.** 새 컨트롤러를 추가하고 보안 규칙을 빠뜨리면
+열리는 것이 아니라 막힌다 — 실수로 열리는 쪽보다 실수로 막히는 쪽이 낫다.
+
+### API 키
+
+```bash
+# 발급 (내부 경로)
+curl -X POST http://localhost:8080/internal/v1/api-keys \
+  -H "X-Internal-Token: <토큰>" -H "Content-Type: application/json" \
+  -d '{"ownerId":"alice","label":"연동용"}'
+```
+
+**평문은 이 응답에서만 볼 수 있다.** 서버는 SHA-256 해시만 갖고 있어 다시 보여줄
+방법이 없다. 문서의 카드번호 마스킹과 같은 원칙이다 — 원본을 갖고 있지 않으면
+유출될 것도 없다.
+
+> **왜 bcrypt 가 아니라 SHA-256 인가.** bcrypt·argon2 같은 느린 해시는 *저엔트로피
+> 비밀번호*를 무차별 대입에서 지키기 위한 것이다. 여기서 다루는 키는 256비트 난수라
+> 무차별 대입이 애초에 불가능하므로 늘릴 이유가 없다. 오히려 **요청마다** 수행되는
+> 검증에 느린 해시를 쓰면 지연만 커진다. 중요한 것은 키 생성이 예측 불가능한 것이고,
+> 그래서 `SecureRandom` 을 쓴다.
+
+`last_used_at` 은 요청마다 쓰지 않고 5분 간격으로만 갱신한다. 매번 쓰면 읽기만 하는
+호출도 전부 쓰기가 된다.
+
+### 내부 토큰
+
+비교는 `MessageDigest.isEqual` 로 한다. `String.equals` 는 첫 불일치에서 멈추므로
+**응답 시간 차이로 토큰을 한 글자씩 알아낼 수 있다.**
+
+개발용 기본값(`local-dev-only-token`)이 쓰이면 기동 시 경고가 뜬다. 이름 자체를
+경고로 삼아, 로그나 설정에서 이 값이 보이면 보호가 없는 상태임을 알 수 있게 했다.
 
 <br>
 
@@ -265,17 +322,25 @@ cd ../ai.ocr-automation.system-config.server && ./gradlew bootRun
 |---|---|
 | API | `http://localhost:8080/api/v1/documents` |
 | H2 콘솔 (local) | `http://localhost:8080/h2-console` (JDBC `jdbc:h2:mem:ocrdb`, user `sa`) |
-| 헬스체크 | `http://localhost:8080/actuator/health` |
+| 헬스체크 | `http://localhost:9080/actuator/health` (관리 전용 포트) |
 
 ```bash
-# 업로드
-curl -H "X-Owner-Id: demo" -F "file=@scan.png" http://localhost:8080/api/v1/documents
+TOKEN=local-dev-only-token   # 개발 기본값
 
-# 처리 (평소엔 스케줄러가 호출한다. 내부 API 는 소유자를 가리지 않는다)
-curl -X POST http://localhost:8080/internal/v1/ocr/process-pending
+# 1) 키 발급
+KEY=$(curl -sS -X POST http://localhost:8080/internal/v1/api-keys \
+        -H "X-Internal-Token: $TOKEN" -H "Content-Type: application/json" \
+        -d '{"ownerId":"demo","label":"로컬"}' | jq -r .key)
 
-# 결과
-curl -H "X-Owner-Id: demo" http://localhost:8080/api/v1/documents/{id}/text
+# 2) 업로드
+curl -H "X-API-Key: $KEY" -F "file=@scan.png" http://localhost:8080/api/v1/documents
+
+# 3) 처리 (평소엔 스케줄러가 호출한다. 내부 API 는 소유자를 가리지 않는다)
+curl -X POST -H "X-Internal-Token: $TOKEN" \
+     http://localhost:8080/internal/v1/ocr/process-pending
+
+# 4) 결과
+curl -H "X-API-Key: $KEY" http://localhost:8080/api/v1/documents/{id}/text
 ```
 
 ### 테스트
@@ -289,7 +354,8 @@ curl -H "X-Owner-Id: demo" http://localhost:8080/api/v1/documents/{id}/text
 | `DocumentTest` | 상태 전이 규칙 (재시도, 정체 판정, 잘못된 전이 차단) |
 | `LocalFileSystemDocumentStorageTest` | 키 생성, 경로 조작 차단, 파일명 충돌 |
 | `DocumentProcessingServiceTest` | 접수 규칙 — 큐 포화 시 선점 해제, 재시도 횟수 미증가 |
-| `DocumentOwnerIsolationTest` | 소유자 격리 — 남의 문서 차단, 소유자별 중복 판정, 헤더 누락 |
+| `DocumentOwnerIsolationTest` | 소유자 격리 — 남의 문서 차단, 소유자별 중복 판정 |
+| `AuthenticationTest` | 세 갈래 인증 — 키 누락·오류·폐기, 토큰 오류, 권한 교차, 미매핑 경로 |
 | `DocumentPipelineIntegrationTest` | 업로드 → 접수 → 비동기 처리 → 조회 HTTP 왕복 |
 
 > 테스트는 **Flyway 로 스키마를 만들고 JPA 는 `validate` 만** 한다.
@@ -318,6 +384,7 @@ curl -H "X-Owner-Id: demo" http://localhost:8080/api/v1/documents/{id}/text
 | 영역 | 기술 |
 |---|---|
 | 언어 | Java 21 |
+| 인증 | Spring Security (API 키 / 공유 토큰) |
 | 프레임워크 | Spring Boot 3.5.16 |
 | 설정 | Spring Cloud Config Client (2025.0.3) |
 | 영속성 | Spring Data JPA, PostgreSQL (운영) / H2 (로컬·테스트) |
@@ -331,8 +398,11 @@ curl -H "X-Owner-Id: demo" http://localhost:8080/api/v1/documents/{id}/text
 
 초기 구조 단계라 의도적으로 비워둔 부분. 실사용 전에 각각 해결해야 한다.
 
-- **인증이 없다** — 소유자 *격리*는 들어왔지만 소유자를 *증명*하는 장치가 없다. `X-Owner-Id` 헤더는 누구나 바꿔 보낼 수 있으므로, 남의 소유자 식별자를 알면 그 문서를 볼 수 있다. Phase 1.3 에서 API Key 로 교체한다.
-- **`/internal` 이 공개 포트에 열려 있다** — 누구나 배치를 돌리거나 정체 회수를 부를 수 있다. 내부 포트 분리와 서비스 간 인증이 필요하다.
+- **HTTPS 가 없다** — API 키와 내부 토큰이 평문으로 오간다. 신뢰할 수 없는 구간을 지난다면 TLS 종단이 반드시 필요하다.
+- **키 발급 권한이 서비스 간 토큰과 같다** — 스케줄러가 쓰는 토큰으로 키도 발급할 수 있다. 운영자 권한을 따로 두어야 한다.
+- **`/internal` 이 공개 포트에 열려 있다** — 토큰으로 막혀 있지만 경로 자체는 8080 에 노출된다. 방화벽이나 인그레스에서 차단하는 것이 1차 방어다.
+- **키 만료가 없다** — 폐기는 수동이며 유효기간이 없다. 회전 정책이 필요하다.
+- **요청 한도가 없다** — 키 하나로 무제한 호출할 수 있다.
 - **파일 내용을 검증하지 않는다** — `Content-Type` 헤더만 믿는다. 확장자를 바꾼 실행 파일도 통과하므로 매직 바이트 검사가 필요하다.
 - **파일 전체를 메모리에 올린다** — `MultipartFile.getBytes()` 로 통째로 읽는다. 20MB 제한이 있어 당장은 버티지만, 큰 파일을 다루려면 스트리밍으로 바꿔야 한다.
 - **Tesseract 신뢰도를 수집하지 않는다** — `confidence` 가 항상 `null` 이다. tess4j 의 `getWords()` 로 단어 단위 신뢰도를 모아야 한다.
@@ -345,8 +415,10 @@ curl -H "X-Owner-Id: demo" http://localhost:8080/api/v1/documents/{id}/text
 
 ## 🗺 앞으로
 
-- [ ] API Key 인증으로 `DocumentOwnerResolver` 교체 (헤더 구현 제거)
-- [ ] `/internal` 서비스 간 인증 (내부 포트 분리 + 토큰)
+- [ ] HTTPS 종단
+- [ ] 운영자 권한을 서비스 간 토큰에서 분리
+- [ ] 키 유효기간과 회전 정책
+- [ ] 요청 한도(rate limit)
 - [ ] 매직 바이트 기반 파일 형식 검증
 - [ ] Tesseract 단어 단위 신뢰도 수집
 - [ ] S3 스토리지 어댑터 추가 (포트는 그대로)

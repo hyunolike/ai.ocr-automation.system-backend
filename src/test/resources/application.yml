@@ -22,6 +22,10 @@ ocr:
     base-path: ${java.io.tmpdir}/ocr-test-storage
   engine:
     type: stub
+  security:
+    # 테스트는 고정 토큰을 쓴다. 개발 기본값과 다른 값이어야
+    # "기본값이라 통과한 것"이 아님이 분명해진다.
+    internal-token: test-internal-token
   processing:
     max-retries: 3
     stale-after-minutes: 10

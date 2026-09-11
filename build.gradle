@@ -27,6 +27,7 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
     implementation 'org.springframework.boot:spring-boot-starter-validation'
     implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    implementation 'org.springframework.boot:spring-boot-starter-security'
 
     // 설정 서버(ocr-config-server)에서 설정을 내려받는다
     implementation 'org.springframework.cloud:spring-cloud-starter-config'
@@ -49,6 +50,7 @@ dependencies {
     annotationProcessor 'org.projectlombok:lombok'
 
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.springframework.security:spring-security-test'
     // 비동기 처리 완료를 기다린다. sleep 으로 때우면 느리거나 불안정해진다.
     testImplementation 'org.awaitility:awaitility'
     testCompileOnly 'org.projectlombok:lombok'

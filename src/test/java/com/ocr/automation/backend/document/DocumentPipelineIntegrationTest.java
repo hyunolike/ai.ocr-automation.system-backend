@@ -11,7 +11,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
-import com.ocr.automation.backend.owner.header.HeaderDocumentOwnerResolver;
+import com.ocr.automation.backend.security.AuthenticatedRequests;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
@@ -53,12 +53,18 @@ class DocumentPipelineIntegrationTest {
     private ObjectMapper objectMapper;
 
     @BeforeEach
-    void clearDocuments() {
+    void setUp() {
         documentRepository.deleteAll();
+        apiKey = auth.issueKeyFor(OWNER);
     }
 
     private static final String OWNER = "owner-a";
-    private static final String OTHER_OWNER = "owner-b";
+
+    @Autowired
+    private AuthenticatedRequests auth;
+
+    /** 매 테스트마다 새 키를 발급받는다. 키 발급 경로 자체도 함께 검증된다. */
+    private String apiKey;
 
     private MockMultipartFile pngFile(String filename, String body) {
         return new MockMultipartFile(
@@ -81,7 +87,7 @@ class DocumentPipelineIntegrationTest {
     private String uploadAndGetId(String ownerId, MockMultipartFile file) throws Exception {
         MvcResult result = mockMvc.perform(multipart("/api/v1/documents")
                         .file(file)
-                        .header(HeaderDocumentOwnerResolver.OWNER_HEADER, ownerId))
+                        .header("X-API-Key", auth.issueKeyFor(ownerId)))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.status").value("PENDING"))
                 .andReturn();
@@ -92,7 +98,7 @@ class DocumentPipelineIntegrationTest {
     @Test
     void 업로드하면_대기_상태로_등록된다() throws Exception {
         mockMvc.perform(multipart("/api/v1/documents").file(pngFile("scan.png", "업로드-1"))
-                        .header(HeaderDocumentOwnerResolver.OWNER_HEADER, OWNER))
+                        .header("X-API-Key", apiKey))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.id").isNotEmpty())
                 .andExpect(jsonPath("$.originalFilename").value("scan.png"))
@@ -105,7 +111,7 @@ class DocumentPipelineIntegrationTest {
         String id = uploadAndGetId(pngFile("scan.png", "파이프라인-전체"));
 
         // 접수만 하고 즉시 202 를 돌려준다. 이 시점에 처리는 끝나지 않았다.
-        mockMvc.perform(post("/internal/v1/ocr/process-pending").param("batchSize", "10"))
+        mockMvc.perform(auth.asInternal(post("/internal/v1/ocr/process-pending")).param("batchSize", "10"))
                 .andExpect(status().isAccepted())
                 .andExpect(jsonPath("$.queued").value(1))
                 .andExpect(jsonPath("$.rejected").value(0))
@@ -113,14 +119,14 @@ class DocumentPipelineIntegrationTest {
 
         awaitStatus(id, DocumentStatus.COMPLETED);
 
-        mockMvc.perform(get("/api/v1/documents/{id}", id).header(HeaderDocumentOwnerResolver.OWNER_HEADER, OWNER))
+        mockMvc.perform(get("/api/v1/documents/{id}", id).header("X-API-Key", apiKey))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("COMPLETED"))
                 .andExpect(jsonPath("$.ocrResult.engine").value("stub"))
                 .andExpect(jsonPath("$.ocrResult.textLength").value(org.hamcrest.Matchers.greaterThan(0)))
                 .andExpect(jsonPath("$.ocrResult.processedAt").isNotEmpty());
 
-        mockMvc.perform(get("/api/v1/documents/{id}/text", id).header(HeaderDocumentOwnerResolver.OWNER_HEADER, OWNER))
+        mockMvc.perform(get("/api/v1/documents/{id}/text", id).header("X-API-Key", apiKey))
                 .andExpect(status().isOk())
                 .andExpect(result -> assertThat(result.getResponse().getContentAsString())
                         .contains("stub-ocr")
@@ -131,7 +137,7 @@ class DocumentPipelineIntegrationTest {
     void 처리_전에_텍스트를_요청하면_400() throws Exception {
         String id = uploadAndGetId(pngFile("scan.png", "아직-처리-안됨"));
 
-        mockMvc.perform(get("/api/v1/documents/{id}/text", id).header(HeaderDocumentOwnerResolver.OWNER_HEADER, OWNER))
+        mockMvc.perform(get("/api/v1/documents/{id}/text", id).header("X-API-Key", apiKey))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.code").value("INVALID_DOCUMENT"));
     }
@@ -153,7 +159,7 @@ class DocumentPipelineIntegrationTest {
                 "file", "note.txt", MediaType.TEXT_PLAIN_VALUE, "본문".getBytes(StandardCharsets.UTF_8));
 
         mockMvc.perform(multipart("/api/v1/documents").file(file)
-                        .header(HeaderDocumentOwnerResolver.OWNER_HEADER, OWNER))
+                        .header("X-API-Key", apiKey))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.code").value("INVALID_DOCUMENT"));
     }
@@ -164,14 +170,14 @@ class DocumentPipelineIntegrationTest {
                 "file", "empty.png", MediaType.IMAGE_PNG_VALUE, new byte[0]);
 
         mockMvc.perform(multipart("/api/v1/documents").file(file)
-                        .header(HeaderDocumentOwnerResolver.OWNER_HEADER, OWNER))
+                        .header("X-API-Key", apiKey))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.code").value("INVALID_DOCUMENT"));
     }
 
     @Test
     void 없는_문서를_조회하면_404() throws Exception {
-        mockMvc.perform(get("/api/v1/documents/{id}", "존재하지-않는-아이디").header(HeaderDocumentOwnerResolver.OWNER_HEADER, OWNER))
+        mockMvc.perform(get("/api/v1/documents/{id}", "존재하지-않는-아이디").header("X-API-Key", apiKey))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("DOCUMENT_NOT_FOUND"));
     }
@@ -182,13 +188,13 @@ class DocumentPipelineIntegrationTest {
         uploadAndGetId(pngFile("b.png", "목록-B"));
 
         mockMvc.perform(get("/api/v1/documents")
-                        .header(HeaderDocumentOwnerResolver.OWNER_HEADER, OWNER)
+                        .header("X-API-Key", apiKey)
                         .param("status", "PENDING"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.content.length()").value(2));
 
         mockMvc.perform(get("/api/v1/documents")
-                        .header(HeaderDocumentOwnerResolver.OWNER_HEADER, OWNER)
+                        .header("X-API-Key", apiKey)
                         .param("status", "COMPLETED"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.content.length()").value(0));
@@ -197,17 +203,17 @@ class DocumentPipelineIntegrationTest {
     @Test
     void 이미_처리된_문서는_다시_처리할_수_없다() throws Exception {
         String id = uploadAndGetId(pngFile("scan.png", "재처리-대상"));
-        mockMvc.perform(post("/internal/v1/ocr/process-pending")).andExpect(status().isAccepted());
+        mockMvc.perform(auth.asInternal(post("/internal/v1/ocr/process-pending"))).andExpect(status().isAccepted());
         awaitStatus(id, DocumentStatus.COMPLETED);
 
-        mockMvc.perform(post("/internal/v1/ocr/documents/{id}/process", id))
+        mockMvc.perform(auth.asInternal(post("/internal/v1/ocr/documents/{id}/process", id)))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.code").value("INVALID_DOCUMENT"));
     }
 
     @Test
     void 대기_문서가_없으면_아무것도_접수하지_않는다() throws Exception {
-        mockMvc.perform(post("/internal/v1/ocr/process-pending"))
+        mockMvc.perform(auth.asInternal(post("/internal/v1/ocr/process-pending")))
                 .andExpect(status().isAccepted())
                 .andExpect(jsonPath("$.queued").value(0))
                 .andExpect(jsonPath("$.rejected").value(0));
@@ -228,14 +234,14 @@ class DocumentPipelineIntegrationTest {
 
         // 같은 내용을 다시 업로드
         mockMvc.perform(multipart("/api/v1/documents").file(pngFile("scan.png", "실패-후-재업로드"))
-                        .header(HeaderDocumentOwnerResolver.OWNER_HEADER, OWNER))
+                        .header("X-API-Key", apiKey))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.id").value(id))          // 같은 문서를 재사용하고
                 .andExpect(jsonPath("$.status").value("PENDING"))  // 다시 대기열에 오른다
                 .andExpect(jsonPath("$.retryCount").value(0));     // 재시도 횟수도 초기화된다
 
         // 실제로 다시 처리된다
-        mockMvc.perform(post("/internal/v1/ocr/process-pending"))
+        mockMvc.perform(auth.asInternal(post("/internal/v1/ocr/process-pending")))
                 .andExpect(status().isAccepted())
                 .andExpect(jsonPath("$.queued").value(1));
         awaitStatus(id, DocumentStatus.COMPLETED);
@@ -244,11 +250,11 @@ class DocumentPipelineIntegrationTest {
     @Test
     void 완료된_문서를_다시_올리면_그대로_돌려준다() throws Exception {
         String id = uploadAndGetId(pngFile("scan.png", "완료-후-재업로드"));
-        mockMvc.perform(post("/internal/v1/ocr/process-pending")).andExpect(status().isAccepted());
+        mockMvc.perform(auth.asInternal(post("/internal/v1/ocr/process-pending"))).andExpect(status().isAccepted());
         awaitStatus(id, DocumentStatus.COMPLETED);
 
         mockMvc.perform(multipart("/api/v1/documents").file(pngFile("scan.png", "완료-후-재업로드"))
-                        .header(HeaderDocumentOwnerResolver.OWNER_HEADER, OWNER))
+                        .header("X-API-Key", apiKey))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.id").value(id))
                 .andExpect(jsonPath("$.status").value("COMPLETED"));
@@ -262,7 +268,7 @@ class DocumentPipelineIntegrationTest {
         String second = uploadAndGetId(pngFile("b.png", "배치-B"));
         String third = uploadAndGetId(pngFile("c.png", "배치-C"));
 
-        mockMvc.perform(post("/internal/v1/ocr/process-pending").param("batchSize", "10"))
+        mockMvc.perform(auth.asInternal(post("/internal/v1/ocr/process-pending")).param("batchSize", "10"))
                 .andExpect(status().isAccepted())
                 .andExpect(jsonPath("$.queued").value(3))
                 .andExpect(jsonPath("$.rejected").value(0));
@@ -274,7 +280,7 @@ class DocumentPipelineIntegrationTest {
 
     @Test
     void 정체된_문서가_없으면_회수_건수는_0() throws Exception {
-        mockMvc.perform(post("/internal/v1/ocr/recover-stalled"))
+        mockMvc.perform(auth.asInternal(post("/internal/v1/ocr/recover-stalled")))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.recovered").value(0));
     }

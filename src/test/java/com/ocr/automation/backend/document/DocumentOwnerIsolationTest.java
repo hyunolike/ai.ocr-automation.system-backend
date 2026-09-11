@@ -3,7 +3,7 @@ package com.ocr.automation.backend.document;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ocr.automation.backend.document.repository.DocumentRepository;
-import com.ocr.automation.backend.owner.header.HeaderDocumentOwnerResolver;
+import com.ocr.automation.backend.security.AuthenticatedRequests;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -36,7 +36,14 @@ class DocumentOwnerIsolationTest {
 
     private static final String ALICE = "alice";
     private static final String BOB = "bob";
-    private static final String HEADER = HeaderDocumentOwnerResolver.OWNER_HEADER;
+    private static final String API_KEY = "X-API-Key";
+
+    @Autowired
+    private AuthenticatedRequests auth;
+
+    /** 소유자마다 실제 키를 발급받는다. 이제 소유자는 주장이 아니라 증명이다. */
+    private String aliceKey;
+    private String bobKey;
 
     @Autowired
     private MockMvc mockMvc;
@@ -48,8 +55,14 @@ class DocumentOwnerIsolationTest {
     private ObjectMapper objectMapper;
 
     @BeforeEach
-    void clearDocuments() {
+    void setUp() {
         documentRepository.deleteAll();
+        aliceKey = auth.issueKeyFor(ALICE);
+        bobKey = auth.issueKeyFor(BOB);
+    }
+
+    private String keyOf(String ownerId) {
+        return ALICE.equals(ownerId) ? aliceKey : bobKey;
     }
 
     private MockMultipartFile pngFile(String filename, String body) {
@@ -60,7 +73,7 @@ class DocumentOwnerIsolationTest {
     private String uploadAs(String ownerId, String filename, String body) throws Exception {
         MvcResult result = mockMvc.perform(multipart("/api/v1/documents")
                         .file(pngFile(filename, body))
-                        .header(HEADER, ownerId))
+                        .header(API_KEY, keyOf(ownerId)))
                 .andExpect(status().isCreated())
                 .andReturn();
         JsonNode json = objectMapper.readTree(result.getResponse().getContentAsString());
@@ -71,7 +84,7 @@ class DocumentOwnerIsolationTest {
     void 남의_문서는_조회되지_않는다() throws Exception {
         String aliceDocument = uploadAs(ALICE, "alice.png", "앨리스의 문서");
 
-        mockMvc.perform(get("/api/v1/documents/{id}", aliceDocument).header(HEADER, BOB))
+        mockMvc.perform(get("/api/v1/documents/{id}", aliceDocument).header(API_KEY, bobKey))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("DOCUMENT_NOT_FOUND"));
     }
@@ -80,7 +93,7 @@ class DocumentOwnerIsolationTest {
     void 남의_문서_텍스트도_조회되지_않는다() throws Exception {
         String aliceDocument = uploadAs(ALICE, "alice.png", "앨리스의 문서");
 
-        mockMvc.perform(get("/api/v1/documents/{id}/text", aliceDocument).header(HEADER, BOB))
+        mockMvc.perform(get("/api/v1/documents/{id}/text", aliceDocument).header(API_KEY, bobKey))
                 .andExpect(status().isNotFound());
     }
 
@@ -90,9 +103,9 @@ class DocumentOwnerIsolationTest {
 
         // 403 은 "그 문서가 존재한다"는 사실을 알려주는 셈이라 그 자체로 정보가 샌다.
         // 없는 문서를 조회했을 때와 응답이 구분되지 않아야 한다.
-        String forOther = mockMvc.perform(get("/api/v1/documents/{id}", aliceDocument).header(HEADER, BOB))
+        String forOther = mockMvc.perform(get("/api/v1/documents/{id}", aliceDocument).header(API_KEY, bobKey))
                 .andReturn().getResponse().getContentAsString();
-        String forMissing = mockMvc.perform(get("/api/v1/documents/{id}", "없는-문서").header(HEADER, BOB))
+        String forMissing = mockMvc.perform(get("/api/v1/documents/{id}", "없는-문서").header(API_KEY, bobKey))
                 .andReturn().getResponse().getContentAsString();
 
         assertThat(objectMapper.readTree(forOther).get("code").asText())
@@ -105,11 +118,11 @@ class DocumentOwnerIsolationTest {
         uploadAs(ALICE, "a2.png", "앨리스 2");
         uploadAs(BOB, "b1.png", "밥 1");
 
-        mockMvc.perform(get("/api/v1/documents").header(HEADER, ALICE))
+        mockMvc.perform(get("/api/v1/documents").header(API_KEY, aliceKey))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.content.length()").value(2));
 
-        mockMvc.perform(get("/api/v1/documents").header(HEADER, BOB))
+        mockMvc.perform(get("/api/v1/documents").header(API_KEY, bobKey))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.content.length()").value(1));
 
@@ -136,30 +149,15 @@ class DocumentOwnerIsolationTest {
     }
 
     @Test
-    void 소유자_헤더가_없으면_거절한다() throws Exception {
-        mockMvc.perform(get("/api/v1/documents"))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value("OWNER_REQUIRED"));
+    void 소유자는_이제_주장이_아니라_증명이다() throws Exception {
+        String aliceDocument = uploadAs(ALICE, "alice.png", "앨리스의 문서");
 
-        mockMvc.perform(multipart("/api/v1/documents").file(pngFile("scan.png", "헤더 없음")))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value("OWNER_REQUIRED"));
-
-        assertThat(documentRepository.count()).isZero();
-    }
-
-    @Test
-    void 소유자_헤더가_비어_있어도_거절한다() throws Exception {
-        mockMvc.perform(get("/api/v1/documents").header(HEADER, "   "))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value("OWNER_REQUIRED"));
-    }
-
-    @Test
-    void 소유자_식별자가_너무_길면_거절한다() throws Exception {
-        mockMvc.perform(get("/api/v1/documents").header(HEADER, "x".repeat(65)))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value("OWNER_REQUIRED"));
+        // 밥이 자기 키로 앨리스를 "주장"할 방법이 없다. 소유자는 키에 묶여 있고
+        // 요청 어디에도 소유자를 지정하는 자리가 없다.
+        mockMvc.perform(get("/api/v1/documents/{id}", aliceDocument)
+                        .header(API_KEY, bobKey)
+                        .header("X-Owner-Id", ALICE))   // 옛 헤더는 이제 아무 의미가 없다
+                .andExpect(status().isNotFound());
     }
 
     @Test
@@ -168,8 +166,9 @@ class DocumentOwnerIsolationTest {
         uploadAs(BOB, "b.png", "밥 문서");
 
         // 스케줄러는 시스템 전체의 대기 문서를 집어야 한다. 소유자로 나뉘면 안 된다.
-        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
-                        .post("/internal/v1/ocr/process-pending"))
+        mockMvc.perform(auth.asInternal(
+                        org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                                .post("/internal/v1/ocr/process-pending")))
                 .andExpect(status().isAccepted())
                 .andExpect(jsonPath("$.queued").value(2));
     }
