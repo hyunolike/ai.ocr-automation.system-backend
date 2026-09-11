@@ -15,6 +15,7 @@ OCR 자동화 시스템의 **백엔드**. 문서 업로드/조회 API 와 OCR �
   OCR 실행(워커 풀, 트랜잭션 밖)을 분리한다
 - **상태 전이 규칙은 도메인이 지킨다** — setter 없이 의미 있는 메서드로만 상태를 바꾼다
 - **남의 문서가 새어나가지 않게 한다** — 공개 API 의 모든 조회에 소유자 조건이 붙는다
+- **헤더가 아니라 내용을 믿는다** — 업로드 파일의 형식을 매직 바이트로 확인한다
 
 <br>
 
@@ -122,6 +123,7 @@ X-Internal-Token: <토큰>
 | `FORBIDDEN` | 403 | 인증은 됐으나 그 경로의 권한이 아님 (예: API 키로 `/internal` 호출) |
 | `DOCUMENT_NOT_FOUND` | 404 | 없는 문서, **또는 남의 문서** |
 | `INVALID_DOCUMENT` | 400 | 형식·크기 위반, 결과가 아직 없음, 처리 대기 상태가 아님 |
+| `CONTENT_MISMATCH` | 400 | 파일 내용이 선언한 형식과 다름, 손상·암호화된 PDF, 페이지 수 초과 |
 | `FILE_TOO_LARGE` | 413 | 업로드 크기 초과 |
 | `STORAGE_ERROR` | 500 | 스토리지 입출력 실패 |
 | `OCR_ENGINE_ERROR` | 503 | 엔진 사용 불가 |
@@ -295,6 +297,31 @@ curl -X POST http://localhost:8080/internal/v1/api-keys \
 `last_used_at` 은 요청마다 쓰지 않고 5분 간격으로만 갱신한다. 매번 쓰면 읽기만 하는
 호출도 전부 쓰기가 된다.
 
+### 업로드 형식 검증
+
+`Content-Type` 은 **클라이언트가 보낸 문자열**이다. 확장자를 `.png` 로 바꾸고 헤더만
+붙이면 무엇이든 통과한다. 그래서 파일 내용의 앞부분(매직 바이트)을 직접 본다.
+
+| 형식 | 시그니처 |
+|---|---|
+| PNG | `89 50 4E 47 0D 0A 1A 0A` |
+| JPEG | `FF D8 FF` |
+| TIFF | `49 49 2A 00` (LE) · `4D 4D 00 2A` (BE) |
+| PDF | `25 50 44 46 2D` (`%PDF-`) |
+
+> **왜 Apache Tika 가 아닌가.** Tika 는 수백 가지 형식을 다루는 대신 의존성과 기동
+> 시간이 무겁다. 여기서 허용하는 형식은 넷뿐이고 각 시그니처는 몇 바이트짜리 상수다.
+> 형식이 열 가지를 넘어가면 그때 검토한다.
+
+PDF 는 시그니처만으로 끝내지 않는다. **암호화됐거나 지나치게 긴 문서**는 통과시켜봐야
+OCR 단계에서 실패하거나 워커를 오래 붙잡는다. 그때는 이미 재시도 한도만큼 낭비한
+뒤다 — 업로드 응답으로 바로 알려주는 편이 낫다.
+
+허용 목록(`ocr.storage.allowed-content-types`)에 형식을 추가하고 시그니처 정의를
+잊으면 업로드가 전부 거부된다. 그 어긋남은 테스트가 먼저 잡는다.
+
+<br>
+
 ### 내부 토큰
 
 비교는 `MessageDigest.isEqual` 로 한다. `String.equals` 는 첫 불일치에서 멈추므로
@@ -356,6 +383,7 @@ curl -H "X-API-Key: $KEY" http://localhost:8080/api/v1/documents/{id}/text
 | `DocumentProcessingServiceTest` | 접수 규칙 — 큐 포화 시 선점 해제, 재시도 횟수 미증가 |
 | `DocumentOwnerIsolationTest` | 소유자 격리 — 남의 문서 차단, 소유자별 중복 판정 |
 | `AuthenticationTest` | 세 갈래 인증 — 키 누락·오류·폐기, 토큰 오류, 권한 교차, 미매핑 경로 |
+| `ContentTypeVerificationTest` | 형식 검증 — 위장 파일 차단, 손상·과길이 PDF, 허용 목록과 시그니처 정합성 |
 | `DocumentPipelineIntegrationTest` | 업로드 → 접수 → 비동기 처리 → 조회 HTTP 왕복 |
 
 > 테스트는 **Flyway 로 스키마를 만들고 JPA 는 `validate` 만** 한다.
@@ -385,6 +413,7 @@ curl -H "X-API-Key: $KEY" http://localhost:8080/api/v1/documents/{id}/text
 |---|---|
 | 언어 | Java 21 |
 | 인증 | Spring Security (API 키 / 공유 토큰) |
+| PDF 검사 | Apache PDFBox |
 | 프레임워크 | Spring Boot 3.5.16 |
 | 설정 | Spring Cloud Config Client (2025.0.3) |
 | 영속성 | Spring Data JPA, PostgreSQL (운영) / H2 (로컬·테스트) |
@@ -403,7 +432,6 @@ curl -H "X-API-Key: $KEY" http://localhost:8080/api/v1/documents/{id}/text
 - **`/internal` 이 공개 포트에 열려 있다** — 토큰으로 막혀 있지만 경로 자체는 8080 에 노출된다. 방화벽이나 인그레스에서 차단하는 것이 1차 방어다.
 - **키 만료가 없다** — 폐기는 수동이며 유효기간이 없다. 회전 정책이 필요하다.
 - **요청 한도가 없다** — 키 하나로 무제한 호출할 수 있다.
-- **파일 내용을 검증하지 않는다** — `Content-Type` 헤더만 믿는다. 확장자를 바꾼 실행 파일도 통과하므로 매직 바이트 검사가 필요하다.
 - **파일 전체를 메모리에 올린다** — `MultipartFile.getBytes()` 로 통째로 읽는다. 20MB 제한이 있어 당장은 버티지만, 큰 파일을 다루려면 스트리밍으로 바꿔야 한다.
 - **Tesseract 신뢰도를 수집하지 않는다** — `confidence` 가 항상 `null` 이다. tess4j 의 `getWords()` 로 단어 단위 신뢰도를 모아야 한다.
 - **PDF 페이지 수를 세지 않는다** — PDF 는 `pageCount` 가 `null` 이다.
@@ -419,7 +447,6 @@ curl -H "X-API-Key: $KEY" http://localhost:8080/api/v1/documents/{id}/text
 - [ ] 운영자 권한을 서비스 간 토큰에서 분리
 - [ ] 키 유효기간과 회전 정책
 - [ ] 요청 한도(rate limit)
-- [ ] 매직 바이트 기반 파일 형식 검증
 - [ ] Tesseract 단어 단위 신뢰도 수집
 - [ ] S3 스토리지 어댑터 추가 (포트는 그대로)
 - [ ] 문서 보관 기간 정책과 정리 배치

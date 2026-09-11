@@ -3,6 +3,7 @@ package com.ocr.automation.backend.document.service;
 import com.ocr.automation.backend.document.domain.Document;
 import com.ocr.automation.backend.document.domain.DocumentStatus;
 import com.ocr.automation.backend.document.repository.DocumentRepository;
+import com.ocr.automation.backend.document.validation.ContentTypeVerifier;
 import com.ocr.automation.backend.storage.DocumentStorage;
 import com.ocr.automation.backend.storage.StorageProperties;
 import lombok.RequiredArgsConstructor;
@@ -31,6 +32,7 @@ public class DocumentApplicationService {
     private final DocumentRepository documentRepository;
     private final DocumentStorage documentStorage;
     private final StorageProperties storageProperties;
+    private final ContentTypeVerifier contentTypeVerifier;
 
     /**
      * 문서를 저장하고 OCR 대기열(PENDING)에 올린다.
@@ -127,6 +129,8 @@ public class DocumentApplicationService {
                     "지원하지 않는 형식입니다: %s (허용: %s)"
                             .formatted(contentType, storageProperties.allowedContentTypes()));
         }
+        // 헤더가 아니라 내용을 본다. 확장자와 헤더는 얼마든지 바꿀 수 있다.
+        contentTypeVerifier.verify(contentType, content);
     }
 
     private String sha256(byte[] content) {

@@ -14,7 +14,6 @@ import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 
-import java.nio.charset.StandardCharsets;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -67,7 +66,7 @@ class DocumentOwnerIsolationTest {
 
     private MockMultipartFile pngFile(String filename, String body) {
         return new MockMultipartFile(
-                "file", filename, MediaType.IMAGE_PNG_VALUE, body.getBytes(StandardCharsets.UTF_8));
+                "file", filename, MediaType.IMAGE_PNG_VALUE, SampleFiles.png(body));
     }
 
     private String uploadAs(String ownerId, String filename, String body) throws Exception {

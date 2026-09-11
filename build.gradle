@@ -39,6 +39,10 @@ dependencies {
     // 없으면 ocr.engine.type=stub 으로 대체한다.
     implementation "net.sourceforge.tess4j:tess4j:${tess4jVersion}"
 
+    // PDF 검사(암호화 여부, 페이지 수). tess4j 가 전이로 끌어오지만 직접 쓰므로 명시한다.
+    // 전이 의존에 기대면 tess4j 가 이걸 떼는 날 조용히 깨진다.
+    implementation 'org.apache.pdfbox:pdfbox'
+
     // DB 스키마 버전 관리
     implementation 'org.flywaydb:flyway-core'
     runtimeOnly 'org.flywaydb:flyway-database-postgresql'

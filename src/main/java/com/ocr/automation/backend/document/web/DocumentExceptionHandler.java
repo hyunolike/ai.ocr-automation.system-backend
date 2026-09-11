@@ -2,6 +2,7 @@ package com.ocr.automation.backend.document.web;
 
 import com.ocr.automation.backend.document.service.DocumentNotFoundException;
 import com.ocr.automation.backend.document.service.InvalidDocumentException;
+import com.ocr.automation.backend.document.validation.ContentMismatchException;
 import com.ocr.automation.backend.document.web.dto.ErrorResponse;
 import com.ocr.automation.backend.ocr.OcrEngineException;
 import com.ocr.automation.backend.owner.OwnerNotResolvedException;
@@ -27,6 +28,16 @@ public class DocumentExceptionHandler {
     public ResponseEntity<ErrorResponse> handleNotFound(DocumentNotFoundException e) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND)
                 .body(ErrorResponse.of("DOCUMENT_NOT_FOUND", e.getMessage()));
+    }
+
+    /**
+     * 형식을 속인 업로드. {@code INVALID_DOCUMENT} 와 상태 코드는 같지만 코드를 나눈다 —
+     * "형식을 잘못 골랐다" 와 "형식을 속였다" 는 운영에서 구분해 볼 가치가 있다.
+     */
+    @ExceptionHandler(ContentMismatchException.class)
+    public ResponseEntity<ErrorResponse> handleContentMismatch(ContentMismatchException e) {
+        return ResponseEntity.badRequest()
+                .body(ErrorResponse.of("CONTENT_MISMATCH", e.getMessage()));
     }
 
     @ExceptionHandler(InvalidDocumentException.class)

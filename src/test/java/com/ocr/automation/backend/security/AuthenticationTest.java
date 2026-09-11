@@ -2,6 +2,7 @@ package com.ocr.automation.backend.security;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.ocr.automation.backend.document.SampleFiles;
 import com.ocr.automation.backend.security.apikey.ApiKeyService;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -12,7 +13,6 @@ import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 
-import java.nio.charset.StandardCharsets;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -45,7 +45,7 @@ class AuthenticationTest {
 
     private MockMultipartFile pngFile() {
         return new MockMultipartFile("file", "scan.png", MediaType.IMAGE_PNG_VALUE,
-                "내용".getBytes(StandardCharsets.UTF_8));
+                SampleFiles.png("내용"));
     }
 
     // ---------------- 공개 API ----------------

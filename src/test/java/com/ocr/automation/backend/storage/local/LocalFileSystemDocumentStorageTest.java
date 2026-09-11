@@ -23,7 +23,7 @@ class LocalFileSystemDocumentStorageTest {
     @BeforeEach
     void setUp() {
         StorageProperties properties = new StorageProperties(
-                tempDir.toString(), 20971520L, List.of("image/png"));
+                tempDir.toString(), 20971520L, List.of("image/png"), 200);
         storage = new LocalFileSystemDocumentStorage(properties);
         storage.prepareBaseDirectory();
     }

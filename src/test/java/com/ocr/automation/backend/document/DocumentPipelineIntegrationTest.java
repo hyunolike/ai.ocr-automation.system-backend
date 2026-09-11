@@ -16,7 +16,6 @@ import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -68,7 +67,7 @@ class DocumentPipelineIntegrationTest {
 
     private MockMultipartFile pngFile(String filename, String body) {
         return new MockMultipartFile(
-                "file", filename, MediaType.IMAGE_PNG_VALUE, body.getBytes(StandardCharsets.UTF_8));
+                "file", filename, MediaType.IMAGE_PNG_VALUE, SampleFiles.png(body));
     }
 
     /** 문서가 해당 상태에 이를 때까지 기다린다. 처리는 워커 스레드에서 비동기로 돈다. */
@@ -156,7 +155,7 @@ class DocumentPipelineIntegrationTest {
     @Test
     void 지원하지_않는_형식은_거부한다() throws Exception {
         MockMultipartFile file = new MockMultipartFile(
-                "file", "note.txt", MediaType.TEXT_PLAIN_VALUE, "본문".getBytes(StandardCharsets.UTF_8));
+                "file", "note.txt", MediaType.TEXT_PLAIN_VALUE, SampleFiles.plain("본문"));
 
         mockMvc.perform(multipart("/api/v1/documents").file(file)
                         .header("X-API-Key", apiKey))
